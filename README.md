@@ -334,3 +334,15 @@ This skill was extracted from a working setup. Before the first run:
 - `SKILL.md` mentions `d:\Claude\` as the workspace root; it only describes where project `CLAUDE.md` files live.
 - The tests write to `<system temp>/prun_test` (`POWER_TEST_ROOT` overrides it).
 - No secrets, tokens or project data are included.
+
+---
+
+## License
+
+Copyright Dragomir Dragolov. Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
+
+- **Free** for personal use, hobby projects, study, research and other noncommercial purposes.
+- **Credit is required:** keep the `Required Notice` line from `LICENSE.md` in every copy or fork, and link back to
+  this repository.
+- **Commercial use** (inside a company, for paying clients, or in a paid product or service) needs a separate
+  commercial license. Open an issue in this repository to ask for one.
