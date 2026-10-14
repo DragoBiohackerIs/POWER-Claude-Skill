@@ -1,4 +1,4 @@
-Required Notice: Copyright Dragomir Dragolov (https://github.com/DragoBiohackerIs/power-claude-skill)
+Required Notice: Copyright Dragomir Dragolov (https://github.com/DragoBiohackerIs/POWER-Claude-Skill)
 
 # PolyForm Noncommercial License 1.0.0
 

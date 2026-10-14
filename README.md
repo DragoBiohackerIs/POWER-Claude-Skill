@@ -1,4 +1,4 @@
-# POWER - multi-agent mode for large tasks in Claude Code
+# POWER - Multi-Agent Mode for Large Tasks in Claude Code
 
 > **Before the first run:** replace `#THE_OPERATOR#` with your name in all files. See [Adapting to another user or workspace](#adapting-to-another-user-or-workspace).
 
