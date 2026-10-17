@@ -62,12 +62,12 @@ BUDGET = {
               "mismatch starting with \"BUDGET:\": the task must be split in the plan, not finished by exploring.",
     "verify": "Budget: at most 15 tool calls. The evidence (the diff and the check report) is already in your "
               "message; open the code only around the changed lines. " + READ_RULE + " Past 15, stop and give the "
-              "verdict on what you have seen, naming in notes what you did not check.",
+              "verdict on what you have seen, naming in unchecked what you did not check.",
     "finalfix": "Budget: about 30 tool calls; the findings are named with file:line. " + READ_RULE + " Past 40, "
                 "stop and return PLAN_MISMATCH with mismatch starting with \"BUDGET:\" and what remains.",
     "finalverify": "Budget: at most 20 tool calls; the diff and the reports are your evidence, open the code only "
                    "around the fixed lines. " + READ_RULE + " Past 20, give the verdict on what you have seen and "
-                   "name what you did not check.",
+                   "name in unchecked what you did not check.",
 }
 
 ENGINE = {
@@ -160,8 +160,13 @@ file): report it, never ignore it.
 pass = true only if every criterion is demonstrably met by the change. problems: one per item,
 "file:line - what is wrong - what is expected". plan_problem = true only if the task cannot meet its
 acceptance as planned (the plan is wrong, not the code). notes: anything the owner should know ("" if none).
+{unchecked_rule}
 
 {limits}"""
+
+UNCHECKED_RULE = """unchecked: what you did not check - a criterion, a file, a case, a page you could not run - at most 5
+items, each naming the file it is about; [] only when you checked everything. The owner sees this list before the
+deploy, so an honest gap is worth more than a silent one."""
 
 VERIFY_ENGINE = {
     "claude": ("You may run read-only commands (the checks, tests, php -l, curl or screenshots of the LOCAL "
@@ -203,6 +208,7 @@ Read the diff and the code around it. {verify_engine}
 pass = true only if every listed finding is demonstrably fixed and nothing else broke (acceptance criteria and
 non-goals in {run_dir}/tasks.json still hold). problems: one per item, "file:line - what is wrong - what is
 expected". plan_problem: false unless a finding cannot be fixed as planned. notes: for the owner ("" if none).
+{unchecked_rule}
 
 {limits}"""
 
@@ -315,12 +321,25 @@ Write only this file.""",
     "codex": "Return the result as the structured output; the script writes the file.",
 }
 
-REVIEW = """You are the FINAL REVIEWER of a POWER run. Read {run_dir}/PLAN.md, the full diff
+SEVERITY = """Severity rubric (by the effect, not by the size of the fix): critical or high = wrong money, stock or
+order status, an auth or role leak, injection, data loss, or a regression on every page or for a whole role;
+medium = a wrong result in a realistic path; low = cosmetic or hypothetical."""
+
+REVIEW = """You are the FINAL REVIEWER of a POWER run. Read the owner's request {run_dir}/request.md (with its section
+"Решения на #THE_OPERATOR#" when it has one), {run_dir}/PLAN.md (its non-goals too), the full diff
 {run_dir}/checks/final/diff.patch, the mechanical re-check {run_dir}/checks/final/report.md, the parallel review
 reports in {run_dir}/review/, the task results in {run_dir}/results.json, and the code around the changes.
 Look at the change as a whole: interactions between tasks, the names and signatures of the contracts,
 duplicated logic, a forgotten registry, manifest or translation, anything outside the plan, the non-goals. The
-review reports can contain false positives: confirm each one against the code before you keep it.
+review reports can contain false positives: confirm each one against the code before you keep it. A lens finding
+you keep goes to findings with the severity of the rubric below (it may differ from the lens's); one you throw
+out goes to dismissed with the reason and the evidence (file:line, or the code that disproves it) - never drop
+one silently.
+{severity}
+Request coverage: split the request and the owner's decisions into at most 10 items and set each against the
+change: done, partial, missing, or out_of_scope_by_plan (a non-goal or a decision in PLAN.md leaves it out on
+purpose); where = the file:line or the task that covers it, or what is absent. A missing item goes to the planner
+as a medium finding by itself: do not repeat it in findings.
 Budget: about 30 tool calls - the diff, the reports and the code around the changed lines as ranges, not the
 modules in full. Past 40, stop and write the review on what you have seen, listing what you did not check.
 Then write the deploy plan from the project deploy docs and the `## POWER` deploy profiles of the project
@@ -348,8 +367,12 @@ REVIEW_OUT = {
 people), {run_dir}/deploy.json (the same plan for power_deploy.py):
 {deploy_shape}
 and {run_dir}/review.json: {{"verdict": "PASS | PASS_WITH_FIXES | FAIL", "findings": [{{"severity":
-"critical|high|medium|low", "file": "...", "line": 0, "problem": "...", "fix": "..."}}]}}. Write only these files.""",
-    "codex": "Return verdict, findings, review_md, deploy_md and deploy (the machine-readable deploy plan) as the structured output; the script writes the files.",
+"critical|high|medium|low", "file": "...", "line": 0, "problem": "...", "fix": "..."}}], "coverage": [{{"request_item":
+"...", "status": "done|partial|missing|out_of_scope_by_plan", "where": "..."}}], "dismissed": [{{"lens": "...",
+"file": "...", "line": 0, "severity": "the lens's severity", "reason": "...", "evidence": "..."}}]}} (an empty
+list when there is nothing to put in it, never a missing key). Write only these files.""",
+    "codex": ("Return verdict, findings, coverage, dismissed, review_md, deploy_md and deploy (the machine-readable deploy "
+              "plan) as the structured output; the script writes the files."),
 }
 
 RECON = """You are an EXPLORER for a POWER run. Map this part of the code for the planner: {focus}
@@ -372,8 +395,10 @@ Read {run_dir}/PLAN.md and the full diff {run_dir}/checks/final/diff.patch, then
 lines as ranges, within 15 tool calls; past 15, write what you have and name what you skipped. The project's
 CLAUDE.md is not in your context: for an environment rule read that one section of it as a range.
 Write your findings to {run_dir}/review/{name}.md, one per item: "severity (critical|high|medium|low) - file:line
-- problem - suggested fix", or "No findings.". Do not change any other file. If you cannot write files, return
-the findings as your answer instead.
+- problem - suggested fix", or "No findings.".
+{severity}
+End the file with one line "Skipped: <what you did not check - files, hunks, cases>" or "Skipped: none". Do not
+change any other file. If you cannot write files, return the findings and the Skipped line as your answer instead.
 Otherwise return one line: how many findings, by severity."""
 
 
@@ -440,24 +465,29 @@ def render_task(kind, plan, t, run_dir, project_dir, engine="claude", dynamic=No
         evidence = dynamic or ("The evidence for this round is in the message that sent you here: the diff of the "
                                "task's files against the snapshot and the report of the mechanical checks (all passed).")
         return VERIFY.format(header=base["header"], task=base["task"], evidence=evidence,
-                             verify_engine=VERIFY_ENGINE[engine], limits=base["limits"])
+                             verify_engine=VERIFY_ENGINE[engine], limits=base["limits"], unchecked_rule=UNCHECKED_RULE)
     raise ValueError(kind)
 
 
 def findings_text(run_dir):
     rv = read_json(os.path.join(run_dir, "review.json"), {}) or {}
     rows = [f for f in rv.get("findings", []) if str(f.get("severity", "")).lower() in ("critical", "high", "medium")]
-    if not rows:
+    # a request item the reviewer found missing is a medium finding (power_run.py sends it down the same fix path)
+    cov = [x for x in (rv.get("coverage") if isinstance(rv.get("coverage"), list) else []) if isinstance(x, dict)][:20]
+    missing = [x for x in cov if str(x.get("status", "")).lower() == "missing"]
+    if not rows and not missing:
         return "(no critical/high/medium findings in review.json)"
-    return "\n".join(f"- [{f.get('severity')}] {f.get('file')}:{f.get('line')} - {f.get('problem')} - fix: {f.get('fix')}"
-                     for f in rows)
+    lines = [f"- [{f.get('severity')}] {f.get('file')}:{f.get('line')} - {f.get('problem')} - fix: {f.get('fix')}" for f in rows]
+    lines += [f"- [medium] request item missing: {x.get('request_item')} (where: {x.get('where') or '-'}) - fix: implement "
+              "it inside the run's files, or leave it and say why it cannot be done there" for x in missing]
+    return "\n".join(lines)
 
 
 def render_final(kind, run_dir, project_dir, engine="claude"):
     """kind: finalfix | finalverify, after the final review (reads review.json)."""
     c = ctx(run_dir, project_dir)
     base = dict(header=HEADER[engine].format(**c), limits=HARD_LIMITS.format(**c) + "\n" + BUDGET[kind],
-                findings=findings_text(run_dir), check_rule=CHECK_RULE, **c)
+                findings=findings_text(run_dir), check_rule=CHECK_RULE, unchecked_rule=UNCHECKED_RULE, **c)
     if kind == "finalfix":
         return FINAL_FIX.format(engine=ENGINE[engine], **base)
     if kind == "finalverify":
@@ -495,7 +525,7 @@ def render_area(run_dir, project_dir, area, prefix, engine="claude"):
 
 def render_review(run_dir, project_dir, engine="claude"):
     c = ctx(run_dir, project_dir)
-    return REVIEW.format(output=REVIEW_OUT[engine].format(deploy_shape=DEPLOY_SHAPE, **c), **c)
+    return REVIEW.format(output=REVIEW_OUT[engine].format(deploy_shape=DEPLOY_SHAPE, **c), severity=SEVERITY, **c)
 
 
 def area_prefix(i):
@@ -547,7 +577,7 @@ def cmd_write(a):
         elif kind in ("recon", "lens"):
             tpl = RECON if kind == "recon" else LENS
             for name, text in parse_items(a.item):
-                write_text(os.path.join(pdir, f"{kind}.{name}.md"), tpl.format(name=name, focus=text, **c))
+                write_text(os.path.join(pdir, f"{kind}.{name}.md"), tpl.format(name=name, focus=text, severity=SEVERITY, **c))
                 written.append(f"{kind}.{name}.md")
         else:
             raise PlanError(f"unknown kind {kind}")

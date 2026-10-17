@@ -18,7 +18,11 @@ authors per task choose the reviewer), finalstatus (V3-05: only CLEAN/FIXED clos
 invalid ## POWER json = INFRA stop), readiness (codex executable + login checked in preflight), perfshort (PERF-02: a
 failed final check skips lenses and reviewer, `continue --diagnose` runs them; PERF-04: instructions inline in the
 message), quota (PERF-03: `codex_task.py usage` only with --refresh-quota), polling (PERF-09: run_job backoff, no fixed
-5 s sleep). All offline: no network, no credentials, no prod.
+5 s sleep), fast (FAST profile: haiku recon/lenses, --effort medium for work/fix, `"fast": false` lens skipped; a run
+without the flag is unchanged), ultraguard (17.10 A: `--disallowedTools Workflow,Agent` on every agent after a `--help`
+probe; none on an old CLI), coverage (B: Gate B НЕПРОВЕРЕНО section, coverage questions c1-c3, `deploy --yes cN`),
+requestcov (C/D: request coverage - a missing item runs the final fix; dismissed lens findings; the severity rubric),
+forecast (E: Gate A cost forecast from 3+ earlier runs). All offline: no network, no credentials, no prod.
 """
 import json
 import os
@@ -396,7 +400,8 @@ def t_start_finalfix():
     c.check("--yes with the token of another candidate is refused, nothing recorded", code != 0 and "another candidate" in out and not c.state().get("deploy_answers"), (out[-300:], c.state().get("deploy_answers")))
     code, out = c.power("deploy", "--yes", "1", "--approved", tok)
     ans = c.state().get("deploy_answers") or {}
-    c.check("--yes 1 --approved records the answer bound to the candidate and clears that stop", code == 0 and "неотговорен въпрос" not in out and ans.get("1", {}).get("text", "").startswith("flip") and ans.get("1", {}).get("candidate") == tok, (out[-400:], ans))
+    # (17.10: deploy.json leaves b.php out, so the harness's coverage question c2 stays open - only item 1 is cleared)
+    c.check("--yes 1 --approved records the answer bound to the candidate and clears that stop", code == 0 and "неотговорен въпрос №1" not in out and ans.get("1", {}).get("text", "").startswith("flip") and ans.get("1", {}).get("candidate") == tok, (out[-400:], ans))
     code, out = c.power("deploy", "--yes", "7", "--approved", tok)
     c.check("--yes for an unknown item is refused", code != 0 and "no needs_yes item 7" in out, out[-200:])
     # the candidate changes (deploy.json edited): the recorded yes is for the old one and the stop is back
@@ -1706,6 +1711,289 @@ def t_polling():
     return c
 
 
+def t_fast():
+    """FAST (15.10): `--flags START,FAST` or `--fast` = state["fast"]; recon and lenses run on haiku, work / fix / area
+    agents get `--effort medium`, a config lens with `"fast": false` is skipped; plan, verifier and final review keep
+    their model and no effort flag; the echo line says FAST. A run without the flag keeps the old knobs (recon on
+    sonnet, no effort for work, `fast` false in the state) - the other scenarios never see FAST."""
+    md = CLAUDE_MD.replace('{"name": "smoke", "focus": "the pages"}',
+                           '{"name": "smoke", "focus": "the pages"}, {"name": "i18n", "focus": "the languages", "fast": false}')
+    c = Case("fast", claude_md=md)
+    s = base_scenario()
+    s["work"]["t1"] = {"result": DONE, "edits": [{"file": "a.php", "replace": ["OLD_A", "NEW_A_TYPO"]}]}
+    s["verify"] = {"t1": [{"verdict": FAIL}, {"verdict": PASS}], "*": {"verdict": PASS}}
+    s["fix"] = {"t1": {"result": DONE, "edits": [{"file": "a.php", "replace": ["NEW_A_TYPO", "NEW_A"]}]}}
+    c.scenario(s)
+    code, out = c.start("--flags", "START,FAST")
+    st, r = c.state(), c.results()
+    c.check("start exits 0", code == 0, out[-600:])
+    c.check("state: fast true, START, no DEPLOY", st.get("fast") is True and st["flags"] == {"start": True, "deploy": False}, (st.get("fast"), st.get("flags")))
+    by = {f"{cc['kind']}:{cc['name']}" if cc["name"] else cc["kind"]: cc for cc in c.calls()}
+    c.check("recon on haiku, effort low as before", by["recon:scope"]["model"] == "haiku" and by["recon:scope"]["effort"] == "low", by.get("recon:scope"))
+    c.check("lenses on haiku; i18n (fast: false) skipped", by["lens:domain"]["model"] == "haiku" and by["lens:smoke"]["model"] == "haiku" and "lens:i18n" not in by, sorted(by))
+    c.check("work and fix on sonnet with --effort medium", by["work:t1"]["model"] == "sonnet" and by["work:t1"]["effort"] == "medium" and by["fix:t1"]["model"] == "sonnet" and by["fix:t1"]["effort"] == "medium", (by.get("work:t1"), by.get("fix:t1")))
+    c.check("plan, verify and review keep opus and no effort flag", by["plan"]["model"] == "opus" and by["plan"]["effort"] in ("", None) and by["verify:t1"]["model"] == "opus" and by["verify:t1"]["effort"] in ("", None) and by["review"]["model"] == "opus" and by["review"]["effort"] in ("", None), (by.get("plan"), by.get("verify:t1"), by.get("review")))
+    c.check("t1 PASS after one fix, final CLEAN, phase gate_b", r["t1"]["status"] == "PASS" and r["t1"]["rounds"] == 2 and st["final"]["status"] == "CLEAN" and st["phase"] == "gate_b", (r.get("t1"), st.get("final", {}).get("status"), st.get("phase")))
+    log = c.read("harness", "log.txt")
+    c.check("echo line says FAST and the knobs", "POWER START FAST ·" in log and "FAST: изпълнение effort medium, recon/лещи Haiku, паралел 4" in log, log[:500])
+    gb = c.read("harness", "gate_b.md")
+    c.check("gate_b.md carries the FAST echo line", "POWER START FAST" in gb, gb[:300])
+    # --fast alone (no START): the same profile, stops at Gate A; a plain start keeps the old knobs
+    c2 = Case("fast_flag", claude_md=md)
+    c2.scenario(base_scenario())
+    code, out = c2.start("--fast")
+    st2, by2 = c2.state(), {f"{cc['kind']}:{cc['name']}" if cc["name"] else cc["kind"]: cc for cc in c2.calls()}
+    c.check("--fast: state fast, gate_a, recon on haiku, plan on opus", code == 0 and st2.get("fast") is True and st2["phase"] == "gate_a" and by2["recon:scope"]["model"] == "haiku" and by2["plan"]["model"] == "opus", (code, st2.get("fast"), st2.get("phase"), by2))
+    c.check("--fast echo line: POWER FAST (no START)", "POWER FAST ·" in c2.read("harness", "log.txt"), c2.read("harness", "log.txt")[:300])
+    c3 = Case("fast_off", claude_md=md)
+    c3.scenario(base_scenario())
+    code, out = c3.start("--flags", "START")
+    st3, by3 = c3.state(), {f"{cc['kind']}:{cc['name']}" if cc["name"] else cc["kind"]: cc for cc in c3.calls()}
+    c.check("without FAST: fast false, recon on sonnet, work without effort, i18n lens runs", st3.get("fast") is False and by3["recon:scope"]["model"] == "sonnet" and by3["work:t1"]["effort"] in ("", None) and "lens:i18n" in by3 and by3["lens:i18n"]["model"] == "sonnet", (st3.get("fast"), by3.get("recon:scope"), by3.get("work:t1"), sorted(by3)))
+    c.check("without FAST: no FAST in the echo line", "FAST" not in c3.read("harness", "log.txt").split("\n")[0], c3.read("harness", "log.txt")[:300])
+    code, out = c3.power("start", "--request-file", os.path.join(c3.dir, "request.md"), "--step1", "opus", "--step2", "sonnet", "--step3", "opus", "--flags", "START,TURBO", "--force")
+    c.check("unknown flag TURBO is refused and names FAST", code != 0 and "TURBO" in out and "START, DEPLOY, FAST" in out, out[-300:])
+    if not c.failed:
+        rm_rf(c2.dir)
+        rm_rf(c3.dir)
+    return c
+
+
+def t_power_json():
+    """The POWER config may live in `.claude/power.json` instead of the `## POWER` block (15.10): the same keys, the
+    same merge, `config` names the file as the source and a full START run uses its lenses; both in one directory is
+    PREFLIGHT FAILED (two sources would drift), an invalid file is the same stop as an invalid block."""
+    md = "# test project\n\nno POWER section here\n"
+    block = json.loads(CLAUDE_MD.split("```json\n", 1)[1].split("\n```", 1)[0])
+    block["lenses"] = [{"name": "domain", "focus": "the traps"}, {"name": "extra", "focus": "the json file"}]
+
+    def write_json(case, text):
+        jp = os.path.join(case.proj, ".claude", "power.json")
+        os.makedirs(os.path.dirname(jp), exist_ok=True)
+        open(jp, "w", encoding="utf-8", newline="\n").write(text)
+        for cmd in (["git", "add", "."], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "config"]):
+            subprocess.run(cmd, cwd=case.proj, capture_output=True, creationflags=CREATE_NO_WINDOW)
+
+    def config(case):
+        p = subprocess.run([PY, os.path.join(SKILL, "power_check.py"), "config", "--project-dir", case.proj], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", env=dict(os.environ, PYTHONUTF8="1"), creationflags=CREATE_NO_WINDOW)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+    c = Case("powerjson", claude_md=md)
+    write_json(c, json.dumps(block, ensure_ascii=False, indent=1))
+    code, out = config(c)
+    c.check("config: power.json is the source and its lenses are listed", code == 0 and "power.json" in out and "extra" in out and "CLAUDE.md" not in out, out[-400:])
+    c.scenario(base_scenario())
+    code, out = c.start("--flags", "START")
+    st = c.state()
+    c.check("start with power.json only: gate_b, the extra lens ran, no smoke lens (not in the file)",
+            code == 0 and st["phase"] == "gate_b" and "lens:extra" in c.kinds() and "lens:smoke" not in c.kinds(), (code, st.get("phase"), c.kinds(), out[-300:]))
+    c2 = Case("powerjson_both")          # the CLAUDE.md block of the fixture + a power.json
+    write_json(c2, json.dumps(block))
+    code, out = config(c2)
+    c.check("both sources in one directory: config refuses and says so", code != 0 and "two POWER configs" in out, out[-400:])
+    c2.scenario(base_scenario())
+    code, out = c2.start("--flags", "START")
+    c.check("both sources: PREFLIGHT FAILED, no state, no agent",
+            code != 0 and "PREFLIGHT FAILED" in out and "two POWER configs" in out and not os.path.exists(os.path.join(c2.run, "harness", "state.json")) and not c2.calls(), out[-500:])
+    c3 = Case("powerjson_bad", claude_md=md)
+    write_json(c3, "{,")
+    c3.scenario(base_scenario())
+    code, out = c3.start("--flags", "START")
+    c.check("invalid power.json: PREFLIGHT FAILED names invalid json in the file, no agent",
+            code != 0 and "PREFLIGHT FAILED" in out and "invalid json" in out and "power.json" in out and not c3.calls(), out[-500:])
+    if not c.failed:
+        rm_rf(c2.dir)
+        rm_rf(c3.dir)
+    return c
+
+
+def t_ultraguard():
+    """A (17.10): a POWER run owns the turn - `start` probes the CLI once (`claude --help`, kept in the state) and every
+    agent gets `--disallowedTools Workflow,Agent`; a CLI without the flag (MOCK_OLD_CLI=1) gets no flag and the run
+    works as before; a state from before the probe is probed once by `continue`."""
+    c = Case("ultraguard")
+    c.scenario(base_scenario())
+    code, out = c.start("--flags", "START")
+    st, calls = c.state(), c.calls()
+    c.check("start: the probe result is in the state, gate_b", code == 0 and st.get("cli_disallowed_tools") is True and st["phase"] == "gate_b",
+            (code, st.get("cli_disallowed_tools"), st.get("phase"), out[-300:]))
+    c.check("every agent got --disallowedTools Workflow,Agent", calls and all(cc.get("disallowed") == "Workflow,Agent" for cc in calls),
+            [(cc["kind"], cc.get("disallowed")) for cc in calls])
+    c.check("the log names the guard", "agents run with --disallowedTools Workflow,Agent" in c.read("harness", "log.txt"))
+    c2 = Case("ultraguard_old")
+    c2.env["MOCK_OLD_CLI"] = "1"
+    c2.scenario(base_scenario())
+    code, out = c2.start("--flags", "START")
+    st2 = c2.state()
+    c.check("old CLI: probe false, no agent got the flag, the run reaches gate_b as before",
+            code == 0 and st2.get("cli_disallowed_tools") is False and c2.calls() and all(not cc.get("disallowed") for cc in c2.calls())
+            and st2["phase"] == "gate_b", (code, st2.get("cli_disallowed_tools"), st2.get("phase"), out[-300:]))
+    c.check("old CLI: the log says the block is off", "the claude CLI has no --disallowedTools" in c2.read("harness", "log.txt"))
+    c3 = Case("ultraguard_resume")
+    c3.scenario(base_scenario())
+    code, out = c3.start()
+    p = os.path.join(c3.run, "harness", "state.json")
+    st3 = json.load(open(p, encoding="utf-8"))
+    st3.pop("cli_disallowed_tools", None)   # a state written before 17.10
+    json.dump(st3, open(p, "w", encoding="utf-8"))
+    code, out = c3.power("continue")
+    st3 = c3.state()
+    work = [cc for cc in c3.calls() if cc["kind"] in ("work", "verify", "lens", "review")]
+    c.check("older state: continue probes once and saves it; the work and review agents get the flag",
+            code == 0 and st3.get("cli_disallowed_tools") is True and work and all(cc.get("disallowed") == "Workflow,Agent" for cc in work),
+            (code, st3.get("cli_disallowed_tools"), [(cc["kind"], cc.get("disallowed")) for cc in work][:4]))
+    if not c.failed:
+        rm_rf(c2.dir)
+        rm_rf(c3.dir)
+    return c
+
+
+def t_coverage():
+    """B (17.10): Gate B lists what the run did NOT check (final.coverage): the verifiers' `unchecked`, a lens dead
+    twice (one retry, then c1), the agents a cap stopped, run files left out of deploy.json, a lens `Skipped:` line, a
+    recon `Unmapped:` line - at most 10 lines, the rest in REPORT.md. The deploy-relevant gaps are harness-owned
+    questions c1-c3 (deploy.json is never edited): a hard stop until `deploy --yes cN --approved <token>`; a changed
+    gap is another question (the old yes is stale); --force does not cover them."""
+    c = Case("coverage")
+    s = base_scenario()
+    s["recon"] = {"text": "# map\n\n- a.php:2 a_init\n\nUnmapped: the cron hooks in b.php"}
+    s["verify"] = {"t1": {"verdict": dict(PASS, unchecked=["a.php: the mobile header was not rendered"])},
+                   "t2": {"verdict": dict(PASS, unchecked=["case one", "case two", "case three", "case four"])}}
+    s["lens"] = {"domain": {"error": "error_max_turns"}, "smoke": {"text": "No findings.\n\n**Skipped:** the mobile layout of b.php"}}
+    s["review"] = {"files": {"REVIEW.md": "clean", "DEPLOY.md": "a.php only", "review.json": {"verdict": "PASS", "findings": [], "dismissed": []},
+                             "deploy.json": {"profile": "shop", "files": [{"local": "a.php", "order": 1, "note": ""}]}}}
+    c.scenario(s)
+    code, out = c.start("--flags", "START")
+    st = c.state()
+    cov = (st.get("final") or {}).get("coverage") or {}
+    c.check("START to gate_b, final CLEAN", code == 0 and st["phase"] == "gate_b" and st["final"]["status"] == "CLEAN", (code, st.get("phase"), out[-400:]))
+    c.check("the dead lens got exactly one retry", c.kinds().count("lens:domain") == 2 and c.kinds().count("lens:smoke") == 1, c.kinds())
+    c.check("coverage block: dead lens, not deployed, unchecked per PASS task, caps, skips, unmapped",
+            cov.get("lenses_dead") == ["domain"] and cov.get("not_deployed") == ["b.php"]
+            and cov.get("unchecked_by_task", {}).get("t1") == ["a.php: the mobile header was not rendered"] and len(cov.get("unchecked_by_task", {}).get("t2") or []) == 4
+            and cov.get("cap_hits") == ["lens:domain (error_max_turns)", "lens:domain#2 (error_max_turns)"]
+            and cov.get("lens_skips") == ["smoke: the mobile layout of b.php"] and cov.get("recon_unmapped") == ["scope: the cron hooks in b.php"], cov)
+    gb = c.read("harness", "gate_b.md")
+    c.check("gate_b: c1, c2, c3 are hard stops", all(f"неотговорен въпрос {q} (покритие, harness)" in gb for q in ("c1", "c2", "c3")), gb)
+    c.check("gate_b: c3 names t1 and the a.php item, c2 names b.php", "t1: a.php: the mobile header" in gb and "deploy.json НЕ качва: b.php" in gb, gb)
+    c.check("gate_b: НЕПРОВЕРЕНО section, 10 lines + (+1 още в REPORT.md)", "НЕПРОВЕРЕНО / ПРОПУСНАТО:" in gb and "(+1 още в REPORT.md)" in gb
+            and "recon, неразучено" not in gb and "Отхвърлени находки на лещите: 0" in gb, gb)
+    rep = c.read("REPORT.md")
+    c.check("REPORT.md: every gap line, the recon one too", "## Непроверено / пропуснато" in rep and "recon, неразучено: scope: the cron hooks in b.php" in rep
+            and "леща, пропуснала: smoke: the mobile layout of b.php" in rep and "агент, спрян от таван: lens:domain#2 (error_max_turns)" in rep, rep[-1500:])
+    code, out = c.power("deploy")
+    tok = c.deploy_token()
+    c.check("deploy dry: the three coverage questions are hard stops", code == 0 and all(f"HARD STOP: неотговорен въпрос {q}" in out for q in ("c1", "c2", "c3")), out[-900:])
+    code, out = c.power("deploy", "--go", "--force", "--approved", tok)
+    c.check("--go --force does not cover them (refusal names c1, c2, c3)", code != 0 and "c1, c2, c3" in out and "--force does not cover" in out, out[-400:])
+    code, out = c.power("deploy", "--yes", "c9", "--approved", tok)
+    c.check("--yes c9 (no such question) is refused", code != 0 and "no open coverage question c9" in out, out[-300:])
+    code, out = c.power("deploy", "--yes", "C2", "--approved", tok)
+    ans = c.state().get("deploy_answers") or {}
+    c.check("--yes C2 records c2 with the candidate and the text; c1, c3 stay",
+            code == 0 and ans.get("c2", {}).get("candidate") == tok and "b.php" in ans.get("c2", {}).get("text", "")
+            and "неотговорен въпрос c2" not in out and "неотговорен въпрос c1" in out and "неотговорен въпрос c3" in out, (out[-700:], ans))
+    # the gap changes (another run file left out): the recorded yes is for another text
+    p = os.path.join(c.run, "harness", "state.json")
+    stj = json.load(open(p, encoding="utf-8"))
+    stj["final"]["coverage"]["not_deployed"] = ["b.php", "c.php"]
+    json.dump(stj, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+    code, out = c.power("deploy")
+    c.check("a changed gap: c2 is open again and says the yes was for another text", "HARD STOP: неотговорен въпрос c2" in out and "за друг текст" in out, out[-900:])
+    return c
+
+
+def t_request_coverage():
+    """C/D (17.10): the final reviewer reads request.md and the plan's non-goals and writes coverage[] and dismissed[]
+    into review.json; a `missing` request item is a medium finding - the final fix path runs even without findings
+    and the fixer's prompt lists it; Gate B prints the missing and partial items and the dismissed count, REPORT.md
+    every coverage row and every dismissed finding; a review.json without `dismissed` is a warning, not silence. The
+    lens and review prompts carry the severity rubric, the lens prompt the `Skipped:` line."""
+    c = Case("requestcov")
+    s = base_scenario()
+    cov = [{"request_item": "flip a.php", "status": "done", "where": "a.php:3"},
+           {"request_item": "flip b.php", "status": "partial", "where": "b.php:3"},
+           {"request_item": "log the change", "status": "missing", "where": "no log call"},
+           {"request_item": "touch c.php", "status": "out_of_scope_by_plan", "where": "t1 non-goal"}]
+    s["review"] = {"files": {"REVIEW.md": "ok", "DEPLOY.md": "manual", "review.json": {
+        "verdict": "PASS_WITH_FIXES", "findings": [], "coverage": cov,
+        "dismissed": [{"lens": "domain", "file": "a.php", "line": 3, "severity": "high", "reason": "false positive", "evidence": "a.php:3 returns NEW_A"}]}}}
+    s["finalfix"] = {"result": dict(DONE, summary="log added"), "edits": [{"file": "a.php", "replace": ["NEW_A", "NEW_A /* logged */"]}]}
+    c.scenario(s)
+    code, out = c.start("--flags", "START")
+    st = c.state()
+    c.check("a missing request item takes the final fix path: finalfix + finalverify, FIXED",
+            code == 0 and "finalfix" in c.kinds() and "finalverify" in c.kinds() and st["final"]["status"] == "FIXED", (code, c.kinds(), st["final"].get("status"), out[-400:]))
+    c.check("the fixer's prompt lists the missing item as medium", "[medium] request item missing: log the change" in c.read("prompts", "finalfix.md"), c.read("prompts", "finalfix.md")[-600:])
+    c.check("review prompt: request.md, non-goals, rubric, coverage and dismissed in the output shape",
+            all(x in c.read("prompts", "review.md") for x in ("request.md", "Решения на #THE_OPERATOR#", "non-goals", "Severity rubric", '"coverage"', '"dismissed"')))
+    c.check("lens prompt: rubric and the Skipped line", "Severity rubric" in c.read("prompts", "lens.domain.md") and "Skipped: none" in c.read("prompts", "lens.domain.md"))
+    rv = st["final"]["review"]
+    c.check("final.review keeps coverage and dismissed", len(rv.get("coverage") or []) == 4 and len(rv.get("dismissed") or []) == 1 and rv.get("dismissed_missing") is False, rv)
+    gb = c.read("harness", "gate_b.md")
+    c.check("gate_b: missing (sent to the fix, verified) and partial items, no done/out_of_scope rows",
+            "заявката, ЛИПСВА: log the change (no log call) - подадена на финалната поправка (проверена: PASS)" in gb and "заявката, частично: flip b.php" in gb
+            and "flip a.php" not in gb and "touch c.php" not in gb, gb)
+    c.check("gate_b: the dismissed count", "Отхвърлени находки на лещите: 1 (REPORT.md)" in gb, gb)
+    rep = c.read("REPORT.md")
+    c.check("REPORT.md: every coverage row and the dismissed finding with its evidence",
+            "## Покритие на заявката" in rep and "- [out_of_scope_by_plan] touch c.php - t1 non-goal" in rep and "- [done] flip a.php - a.php:3" in rep
+            and "## Отхвърлени находки на лещите" in rep and "- [high] domain a.php:3 - false positive (доказателство: a.php:3 returns NEW_A)" in rep, rep[-1500:])
+    c2 = Case("requestcov_nodismissed")
+    s2 = base_scenario()
+    s2["review"] = {"files": {"REVIEW.md": "ok", "DEPLOY.md": "manual", "review.json": {"verdict": "PASS", "findings": [], "coverage": cov[:2]}}}
+    c2.scenario(s2)
+    code, out = c2.start("--flags", "START")
+    st2 = c2.state()
+    gb2 = c2.read("harness", "gate_b.md")
+    c.check("no `dismissed` key: CLEAN (partial is not a fix), the warning in gate_b, REPORT.md and the log",
+            code == 0 and st2["final"]["status"] == "CLEAN" and "finalfix" not in c2.kinds() and "ВНИМАНИЕ: review.json няма списък `dismissed`" in gb2
+            and "ВНИМАНИЕ: review.json няма списък `dismissed`" in c2.read("REPORT.md") and "no `dismissed` list" in c2.read("harness", "log.txt"),
+            (code, st2["final"].get("status"), c2.kinds(), gb2))
+    if not c.failed:
+        rm_rf(c2.dir)
+    return c
+
+
+def t_forecast():
+    """E (17.10): Gate A shows an indicative cost from the earlier runs' calls.jsonl (sibling run folders, this run left
+    out): median (range p25-p75) per role and model times the expected calls, plus what recon and plan already spent; a
+    role with no data for the model uses the role's median over all models (noted). Fewer than 3 earlier runs with
+    priced calls: no line."""
+    def history(case, names, priced=True):
+        for i, name in enumerate(names):
+            h = os.path.join(case.proj, "docs", "power", name, "harness")
+            os.makedirs(h, exist_ok=True)
+            rows = [("work", "sonnet", i + 1.0), ("work", "sonnet", i + 1.0), ("verify", "opus", 2.0), ("verify", "opus", 2.0),
+                    ("fix", "sonnet", 0.5), ("lens", "sonnet", 0.25), ("lens", "sonnet", 0.25), ("review", "opus", 3.0),
+                    ("finalfix", "opus", 1.0), ("finalverify", "opus", 1.0)]
+            with open(os.path.join(h, "calls.jsonl"), "w", encoding="utf-8") as f:
+                for role, model, usd in rows:
+                    f.write(json.dumps({"label": role, "role": role, "model": model, "cost_usd": usd if priced else 0, "ok": True}) + "\n")
+
+    c = Case("forecast")
+    history(c, ["2026-10-01-a", "2026-10-02-b", "2026-10-03-c"])
+    c.scenario(base_scenario())
+    code, out = c.start()
+    ga = c.read("harness", "gate_a.md")
+    # work 2 x median 2 (p25 1.25, p75 2.75), fix 1 x 0.5, verify 2 x 2, lens 2 x 0.25, review 3, finalfix 1,
+    # finalverify (fable: no data) 1 x the role median 1; + 0.10 spent on recon and plan
+    c.check("gate A: the forecast line with the median, the range, 3 runs and the spent part",
+            code == 0 and "Очаквана цена: ~$14.10 (диапазон $12.60-$15.60; медиана на роля и модел от 3 предишни run-а; ориентировъчно; вече похарчени $0.10)" in ga, ga[-900:])
+    c.check("gate A: the role fallback is named", "finalverify fable: медиана на ролята за всички модели" in ga, ga[-600:])
+    c2 = Case("forecast_two")
+    history(c2, ["2026-10-01-a", "2026-10-02-b"])
+    history(c2, ["2026-10-03-codex"], priced=False)   # only cost-0 calls (Codex): not a run for the forecast
+    c2.scenario(base_scenario())
+    code, out = c2.start()
+    c.check("two priced earlier runs (this run and a cost-0 run do not count): no forecast line",
+            code == 0 and "Очаквана цена" not in c2.read("harness", "gate_a.md"), c2.read("harness", "gate_a.md")[-600:])
+    if not c.failed:
+        rm_rf(c2.dir)
+    return c
+
+
 TESTS = {"happy": t_happy, "fix": t_fix, "escalate": t_escalate, "mismatch": t_mismatch, "checkbroken": t_checkbroken,
          "dead": t_dead, "resume": t_resume, "start": t_start_finalfix, "prebroken": t_prebroken, "questions": t_questions,
          "deploytwice": t_deploy_twice, "strayreported": t_stray_reported, "straydiff": t_stray_diff, "noagents": t_noagents,
@@ -1716,7 +2004,8 @@ TESTS = {"happy": t_happy, "fix": t_fix, "escalate": t_escalate, "mismatch": t_m
          "verifystray": t_verify_keeps_stray, "realauthor": t_review_real_author, "planchanges": t_plan_change_history,
          "afterhook": t_after_hook_harness, "preflight": t_preflight, "workflow": t_workflow_parity, "killtree": t_kill_tree,
          "authors": t_authors, "finalstatus": t_final_status, "configbroken": t_config_broken, "readiness": t_readiness,
-         "perfshort": t_perf_short, "quota": t_quota, "polling": t_polling}
+         "perfshort": t_perf_short, "quota": t_quota, "polling": t_polling, "fast": t_fast, "powerjson": t_power_json,
+         "ultraguard": t_ultraguard, "coverage": t_coverage, "requestcov": t_request_coverage, "forecast": t_forecast}
 
 
 def main():

@@ -101,7 +101,7 @@ an agent from a Workflow or a subagent mutate prod. The profile comes from `## P
    `watched`, `rolled_back`.
 4. **DB / options / flags** (`db` in `deploy.json`, each with an `apply` and a `rollback` command) are never executed
    by the script. Hard stop: the orchestrator runs them after an explicit "yes" (token wrapper via
-   `cpanel_file.py put --go` + `curl -k --resolve <domain>:443:<origin_ip>`, then `rm --go` + 404; from Bash
+   the profile's `put` + `curl -k --resolve <domain>:443:<origin_ip>`, then the profile's `rm` + 404; from Bash
    `MSYS_NO_PATHCONV=1` before the `/home/...` paths, otherwise the file lands in
    `/home/<acct>/C:/Program Files/Git/home/...`), **then** `power_deploy.py watch --go --db-rollback`: canary now -
    `HEALTHY` only when every canary answers (V3-03); a canary that is 5xx / unreachable / fatal now and was fine in

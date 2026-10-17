@@ -2,7 +2,7 @@
 """POWER harness: phases 0-6 of a POWER run driven from code, outside the Claude session.
 
   power_run.py start    --run-dir R --project-dir P --request-file F --step1 opus --step2 sonnet --step3 opus
-                        [--flags START,DEPLOY] [--recon name=focus ...] [--lens name=focus ...] [--title T]
+                        [--flags START,DEPLOY,FAST] [--fast] [--recon name=focus ...] [--lens name=focus ...] [--title T]
   power_run.py continue --run-dir R --project-dir P [--replan] [--diagnose] [--refresh-quota]   # after Gate A ("da"), or after a crash
   power_run.py verify   --run-dir R --project-dir P --tasks id:author:round[,...]   # after a fixed check command
   power_run.py status   --run-dir R                              # phase, tasks, running agents, cost, next step
@@ -27,6 +27,14 @@ process on the same run refuses, a lock whose pid is not alive is replaced (logg
 counts every started agent in state.json (`agents_started`); at the cap the phase stops with INCOMPLETE tasks (or an
 INCOMPLETE final review) and a gate text, a higher cap and `continue` resume. A failed Codex job's detached runner
 is killed (codex_task.py kill) before the Claude fallback takes over.
+
+A POWER run owns the turn (17.10, ultracode precedence): every agent runs with `--disallowedTools Workflow,Agent`
+when the CLI knows the flag (probed once with `claude --help`, kept in the state), so no agent opens a workflow or a
+fan-out of its own inside the run. Gate B lists what the run did NOT check (`final.coverage`: the verifiers'
+`unchecked`, skipped / dead lenses, agents stopped by a cap, run files left out of deploy.json, recon gaps, the
+request items the reviewer found missing); the gaps that matter for the deploy are harness-owned questions `c1`-`c3`
+(`deploy --yes cN --approved <token>`), deploy.json is never edited. Gate A shows an indicative cost forecast from
+the earlier runs' calls.jsonl (at least 3 runs).
 
 Environment: POWER_CLAUDE (the claude command; default: `claude` on PATH), POWER_MAX_PARALLEL (6 agent
 processes), POWER_MAX_AGENTS (0: no cap on started agents), POWER_PERMISSION_MODE (auto), POWER_AGENT_TIMEOUT
@@ -79,15 +87,25 @@ ROLES = {
     "verify": ("verifier", 25, None, 5.0), "review": ("executor", 55, None, 15.0),
     "finalfix": ("executor", 55, None, 10.0), "finalverify": ("verifier", 30, None, 5.0),
 }
+# FAST (`POWER ... FAST`, 15.10): cheaper knobs where they do not decide correctness - the effort of the executing
+# roles, the model of recon and lenses, the parallel slots. Verifier, final check, hard stops and Gate B are untouched.
+# A run whose state has no "fast" behaves exactly as before (runs started before the flag existed keep their knobs).
+FAST_EFFORT = {"work": "medium", "fix": "medium", "area": "medium"}
+FAST_MODEL = {"recon": "haiku", "lens": "haiku"}      # only where the role would run on sonnet (the fixed choice)
+FAST_PARALLEL = int(os.environ.get("POWER_FAST_PARALLEL", "8"))
 RESULT_KEYS = {"status": "DONE", "files_changed": [], "mismatch": "", "summary": "", "how_verified": "",
                "open_issues": [], "plan_change": ""}
-VERDICT_KEYS = {"pass": False, "problems": [], "plan_problem": False, "notes": ""}
+VERDICT_KEYS = {"pass": False, "problems": [], "plan_problem": False, "notes": "", "unchecked": []}
 RESULT_FORMAT = ('FINAL ANSWER FORMAT: your last message must be exactly one JSON object and nothing else (no prose '
                  'before or after it, no code fence): {"status": "DONE" | "PLAN_MISMATCH", "files_changed": [...], '
                  '"mismatch": "", "summary": "", "how_verified": "", "open_issues": [...], "plan_change": ""}')
 VERDICT_FORMAT = ('FINAL ANSWER FORMAT: your last message must be exactly one JSON object and nothing else (no prose '
                   'before or after it, no code fence): {"pass": true | false, "problems": ["file:line - what is wrong '
-                  '- what is expected", ...], "plan_problem": true | false, "notes": ""}')
+                  '- what is expected", ...], "plan_problem": true | false, "notes": "", "unchecked": ["what you did '
+                  'not check (a criterion, a file, a case), at most 5; [] when you checked everything"]}')
+UNCHECKED_MAX = 5          # B: the verifier's `unchecked` list kept per task
+DISALLOWED = "Workflow,Agent"   # A: tools no harness agent may use (a POWER run owns the turn)
+COVERAGE_IDS = {"lenses": "c1", "files": "c2", "unchecked": "c3"}   # B: harness-owned Gate B questions, fixed ids
 FILES_FORMAT = "When the files are written, answer with one line that says which files you wrote."
 
 
@@ -220,15 +238,29 @@ class Run:
         self.hdir = os.path.join(self.run_dir, "harness")
         os.makedirs(self.hdir, exist_ok=True)
         self.lock = threading.RLock()
-        self.sem = threading.Semaphore(MAX_PARALLEL)
         self.running = {}
         self._lock_fd = None
         # read without the run lock (status, cost); the commands that write call hold(), which reads it again
         self.state = read_json(os.path.join(self.hdir, "state.json"), None) or {}
+        self.set_parallel()
         if self.project_dir is None:
             self.project_dir = self.state.get("project_dir")
         self.claude = shlex.split(os.environ["POWER_CLAUDE"]) if os.environ.get("POWER_CLAUDE") else \
             [shutil.which("claude") or "claude"]
+
+    @property
+    def fast(self):
+        return bool(self.state.get("fast"))
+
+    def set_parallel(self):
+        """The agent slots: MAX_PARALLEL, or max(MAX_PARALLEL, FAST_PARALLEL) in a FAST run unless POWER_MAX_PARALLEL
+        is set explicitly (the tests pin it to 4). Called once the state is known: in __init__, and by `start` after
+        it writes the new state, before the first agent."""
+        n = MAX_PARALLEL
+        if self.fast and not os.environ.get("POWER_MAX_PARALLEL"):
+            n = max(MAX_PARALLEL, FAST_PARALLEL)
+        self.parallel = n
+        self.sem = threading.Semaphore(n)
 
     # -- one process per run (5.1; V2-07: ownership is an OS lock on an open handle, not the file's existence)
     @property
@@ -318,6 +350,10 @@ class Run:
             pass
 
     # -- the cap on started agents (5.2)
+    def slots_left(self, n):
+        """True when at least n more agents may start under POWER_MAX_AGENTS (always without a cap)."""
+        return not MAX_AGENTS or MAX_AGENTS - int(self.state.get("agents_started") or 0) >= n
+
     def agent_slot(self, label, model):
         """Count one more started agent (atomic in state.json); at POWER_MAX_AGENTS raise AgentCap instead of starting."""
         with self.lock:
@@ -526,9 +562,13 @@ class Run:
         """One headless agent. want: 'result' | 'verdict' | None (a file-writing agent; the text is returned).
         Returns the shaped dict (or the text), None when the agent died or returned nothing usable."""
         agent_role, turns, effort, budget = ROLES[role]
+        if self.fast and role in FAST_EFFORT:
+            effort = FAST_EFFORT[role]   # FAST: the executing roles think less; verifiers keep the default
         agent = agent_override or self.agent_type(agent_role)
         cmd = list(self.claude) + ["-p", "--output-format", "json", "--no-session-persistence", "--model", model,
                                    "--max-turns", str(turns), "--permission-mode", PERMISSION_MODE]
+        if self.state.get("cli_disallowed_tools"):
+            cmd += ["--disallowedTools", DISALLOWED]   # A: no workflow or fan-out of its own inside a POWER run
         if agent:
             cmd += ["--agent", agent]
         if effort:
@@ -570,6 +610,8 @@ class Run:
         if failed:
             why = (data or {}).get("subtype") or (err or raw or "no output").strip()[-300:]
             rec.update({"ok": False, "error": str(why)[:300]})
+            if str((data or {}).get("subtype") or "").startswith("error_max"):
+                rec["cap"] = data["subtype"]   # B: a turn or budget cap ended it - a coverage gap at Gate B
             self.record_call(rec)
             self.log(f"{label}: agent {model} died ({str(why)[:160]})")
             self.status(f"{label} died")
@@ -629,6 +671,8 @@ class Run:
         died; and the family that actually answered, which is what the results record as author / verified_by.
         A Codex job that fails, or a Codex family in a role without a Codex job, falls back once to `fallback`
         (default FALLBACK[model]) through claude; the caller picks a fallback that is not the author of the code."""
+        if self.fast and role in FAST_MODEL and model == "sonnet":
+            model = FAST_MODEL[role]   # FAST: recon and lenses on haiku (a project lens agent type keeps its prompt)
         if model in CODEX:
             slug = self.codex_slug(model)
             why = ""
@@ -866,6 +910,8 @@ class TaskLoop:
             "author": r.get("by") if r else None, "authors": authors, "verified_by": [v.get("by") for v in verdicts], "rounds": len(verdicts),
             "result": strip(r), "last_problems": (last.get("problems") if last and not last.get("pass") else []) or [],
             "notes": (last or {}).get("notes", "") or "", "stray_files": strays, "scope_changes": scope,
+            # B: what the verifier that passed the task says it did not check (Gate B "НЕПРОВЕРЕНО")
+            "unchecked": [str(x) for x in ((last.get("unchecked") or []) if last and last.get("pass") else [])][:UNCHECKED_MAX],
             "check": ({"diff_path": last["check"].get("diff_path"), "report_path": last["check"].get("report_path"),
                        "warnings": last["check"].get("warnings")} if last and last.get("check") else None),
             "finished_at": now(),
@@ -1027,10 +1073,14 @@ def parse_items(items, default=None):
 
 def echo_line(run):
     m, fl = run.models, run.state.get("flags", {})
-    parts = ["POWER" + (" START" if fl.get("start") else "") + (" DEPLOY" if fl.get("deploy") else ""),
+    parts = ["POWER" + (" START" if fl.get("start") else "") + (" DEPLOY" if fl.get("deploy") else "")
+             + (" FAST" if run.fast else ""),
              f"план {NAMES[m['step1']]}", f"изпълнение {NAMES[m['step2']]}", f"финал {NAMES[m['step3']]}",
              f"одобрение на плана: {'не' if fl.get('start') else 'да'}",
              f"потвърждение на деплоя: {'не' if fl.get('deploy') else 'да'}"]
+    if run.fast:
+        parts.append(f"FAST: изпълнение effort {FAST_EFFORT['work']}, recon/лещи {NAMES[FAST_MODEL['recon']]}, "
+                     f"паралел {run.parallel}")
     esc = run.escalate_model()
     if esc != m["step1"]:
         parts.append(f"ескалация {NAMES[esc]} (автоматично: {NAMES[m['step1']]} е и изпълнител)")
@@ -1174,6 +1224,87 @@ def phase_baseline(run):
     run.log("baseline: " + run.state["baseline"]["summary"])
 
 
+FORECAST_MIN_RUNS = 3   # E: with fewer earlier runs that have priced calls Gate A shows no forecast
+
+
+def quantile(xs, q):
+    xs = sorted(xs)
+    if not xs:
+        return 0.0
+    pos = (len(xs) - 1) * q
+    i = int(pos)
+    j = min(i + 1, len(xs) - 1)
+    return xs[i] + (xs[j] - xs[i]) * (pos - i)
+
+
+def cost_forecast(run):
+    """E: the indicative cost line of Gate A, or None with fewer than FORECAST_MIN_RUNS earlier runs. The history is
+    the calls.jsonl of the sibling runs (the folder this run lives in, this run left out). The calls still to come:
+    work = the tasks, fix / verify / finish = the tasks x the history's count of the role per work call, lenses = the
+    lens list, review / finalfix / finalverify = the history's average per run. A call costs the median (range
+    p25-p75) of its role and model among the history's priced calls (ok, cost > 0), else of its role over all
+    models; a Codex model is quota, not $. Recon and plan are spent already (run.cost_total())."""
+    parent = os.path.dirname(run.run_dir)
+    hist = []
+    for name in sorted(os.listdir(parent)) if os.path.isdir(parent) else []:
+        d = os.path.join(parent, name)
+        p = os.path.join(d, "harness", "calls.jsonl")
+        if fwd(os.path.abspath(d)) == run.run_dir or not os.path.isfile(p):
+            continue
+        cs = []
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    c = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(c, dict) and c.get("role"):
+                    cs.append(c)
+        if any(c.get("ok") and float(c.get("cost_usd") or 0) > 0 for c in cs):
+            hist.append(cs)
+    if len(hist) < FORECAST_MIN_RUNS:
+        return None
+    calls = [c for cs in hist for c in cs]
+    priced = [c for c in calls if c.get("ok") and float(c.get("cost_usd") or 0) > 0]
+
+    def count(role):
+        return sum(1 for c in calls if c.get("role") == role)
+
+    per_work = max(1, count("work"))
+    n_tasks = len((read_json(os.path.join(run.run_dir, "tasks.json"), {}) or {}).get("tasks") or [])
+    try:
+        n_lens = len(lens_items(run))
+    except PlanError:
+        n_lens = 2
+    step1, step2 = run.models["step1"], run.models["step2"]
+    expected = [("work", step2, n_tasks), ("fix", step2, n_tasks * count("fix") / per_work),
+                ("verify", run.verifier_for(step2), n_tasks * count("verify") / per_work),
+                ("finish", run.escalate_model(), n_tasks * count("finish") / per_work),
+                ("lens", "haiku" if run.fast else "sonnet", n_lens),
+                ("review", run.final_model(), count("review") / len(hist)),
+                ("finalfix", step1, count("finalfix") / len(hist)),
+                ("finalverify", run.verifier_for(step1), count("finalverify") / len(hist))]
+    mid = lo = hi = 0.0
+    notes, codex = [], False
+    for role, model, n in expected:
+        if n <= 0:
+            continue
+        if model in CODEX:
+            codex = True
+            continue
+        xs = [float(c["cost_usd"]) for c in priced if c.get("role") == role and c.get("model") == model]
+        if not xs:
+            xs = [float(c["cost_usd"]) for c in priced if c.get("role") == role]
+            notes.append(f"{role} {model}: " + ("медиана на ролята за всички модели" if xs else "без данни, не е включено"))
+        mid += n * quantile(xs, 0.5)
+        lo += n * quantile(xs, 0.25)
+        hi += n * quantile(xs, 0.75)
+    spent = run.cost_total()
+    return (f"Очаквана цена: ~${mid + spent:.2f} (диапазон ${lo + spent:.2f}-${hi + spent:.2f}; медиана на роля и модел от "
+            f"{len(hist)} предишни run-а; ориентировъчно; вече похарчени ${spent:.2f})"
+            + ("; Codex: квота, не в $" if codex else "") + (f"; {'; '.join(notes)}" if notes else ""))
+
+
 def gate_a_text(run):
     plan = read_json(os.path.join(run.run_dir, "tasks.json"), {})
     tasks = plan.get("tasks") or []
@@ -1209,8 +1340,11 @@ def gate_a_text(run):
         for row in b.get(key) or []:
             lines.append(f"- {key}: {row}")
     agents = 3 * len(tasks) + 8
-    lines += ["", f"Очаквани агенти: ~{agents} (3 на задача + ~8 фиксирани)" + (" - над 50, планът е голям" if agents > 50 else ""),
-              f"Файлове за CLAIM: {', '.join(sorted({f.get('path') for t in tasks for f in (t.get('files') or [])}))}"]
+    lines += ["", f"Очаквани агенти: ~{agents} (3 на задача + ~8 фиксирани)" + (" - над 50, планът е голям" if agents > 50 else "")]
+    forecast = cost_forecast(run)   # E: hidden with fewer than 3 earlier runs
+    if forecast:
+        lines.append(forecast)
+    lines.append(f"Файлове за CLAIM: {', '.join(sorted({f.get('path') for t in tasks for f in (t.get('files') or [])}))}")
     if stops:
         lines += ["", "Спира дори със START: " + "; ".join(stops) + "."]
     lines += ["", "#THE_OPERATOR#, трябва да решиш дали да пусна изпълнението по този план: „да“ (после `power_run.py continue`), "
@@ -1417,11 +1551,24 @@ def lens_items(run):
     if items:
         return [(x["name"], x["focus"], x.get("agent_type")) for x in items]
     cfg = load_config(run.project_dir)
-    out = [(x.get("name"), x.get("focus", ""), x.get("agent_type")) for x in cfg.get("lenses") or [] if x.get("name")]
+    # FAST skips the config lenses marked `"fast": false` (an explicit --lens list is never filtered)
+    out = [(x.get("name"), x.get("focus", ""), x.get("agent_type")) for x in cfg.get("lenses") or []
+           if x.get("name") and not (run.fast and x.get("fast", True) is False)]
     if not out:
         out = [("domain", "the project's traps and rules from its CLAUDE.md, applied to this diff", None),
                ("smoke", "local smoke of the affected pages and routes; on a UI change desktop and mobile screenshots", None)]
     return out
+
+
+def lenses_skipped(run):
+    """B: the config lenses FAST left out (`"fast": false`); an explicit --lens list skips none."""
+    if run.state.get("lenses") or not run.fast:
+        return []
+    try:
+        cfg = load_config(run.project_dir)
+    except PlanError:
+        return []
+    return [x.get("name") for x in cfg.get("lenses") or [] if x.get("name") and x.get("fast", True) is False]
 
 
 def installed_agent(run, name):
@@ -1480,6 +1627,10 @@ def phase_final(run):
         final["reason"] = f"stopped by the agent cap: {e}"
         run.save()
         run.log(f"final: INCOMPLETE - {final['reason']}")
+    else:
+        # B: what this generation did not check, fixed once here (an INCOMPLETE review has no Gate B to show it on)
+        final["coverage"] = coverage_block(run, final)
+        run.save()
 
 
 def _phase_final(run, final):
@@ -1497,11 +1648,17 @@ def _phase_final(run, final):
         name, focus, atype = item
         agent = installed_agent(run, atype)
         msg = named_msg(run, "lens", name)
-        # a project agent type (e.g. php-reviewer) gets the same message with its own prompt and tools
-        out, _ = run.call("lens", "sonnet", f"lens:{name}", msg, agent_override=agent)
         path = os.path.join(run.run_dir, "review", f"{name}.md")
-        if out is not None and not os.path.isfile(path):
-            write_text(path, out)
+        for attempt in (1, 2):
+            # a project agent type (e.g. php-reviewer) gets the same message with its own prompt and tools
+            out, _ = run.call("lens", "sonnet", f"lens:{name}" + ("" if attempt == 1 else "#2"), msg, agent_override=agent)
+            if out is not None and not os.path.isfile(path):
+                write_text(path, out)
+            # B: a lens that left no report gets one more try (through run.call: counted, budgeted), unless the agent
+            # cap is near - the reviewer needs its slot; a lens dead twice is a Gate B question (c1), not silence
+            if os.path.isfile(path) or attempt == 2 or not run.slots_left(2):
+                break
+            run.log(f"lens:{name}: no report, one more try")
         final.setdefault("lenses", {})[name] = fwd(path) if os.path.isfile(path) else ""
 
     # check --all first: it writes checks/final/diff.patch, which every lens reads (13.10: lenses that started in
@@ -1545,20 +1702,32 @@ def _phase_final(run, final):
         final["review"] = {"by": who or "-", "verdict": "MISSING", "findings": [], "authors": authors, "independent": independent}
         run.log("the final reviewer " + ("died" if answer is None else "wrote no review.json"))
     else:
-        final["review"] = {"by": who, "verdict": rv.get("verdict"), "findings": rv.get("findings") or [], "authors": authors, "independent": independent}
+        final["review"] = {"by": who, "verdict": rv.get("verdict"), "findings": rv.get("findings") or [], "authors": authors, "independent": independent,
+                           # C: the request items against the code; D: the lens findings the reviewer threw out, and why
+                           "coverage": [x for x in (rv.get("coverage") if isinstance(rv.get("coverage"), list) else []) if isinstance(x, dict)][:20],
+                           "dismissed": list(rv.get("dismissed")) if isinstance(rv.get("dismissed"), list) else [],
+                           "dismissed_missing": "dismissed" not in rv}
         run.log(f"review by {who}: {rv.get('verdict')}, {len(rv.get('findings') or [])} findings"
                 + ("" if independent else f" - NOT independent: {who} also wrote code (authors {', '.join(authors)})"))
+        if "dismissed" not in rv:
+            run.log("review.json has no `dismissed` list: the lens findings the reviewer threw out are not visible (Gate B warns)")
     run.save()
     # the deploy plan is validated right away (fetch is the deploy command's job)
     if os.path.isfile(os.path.join(run.run_dir, "deploy.json")):
         code, outp = run.run_py(DEPLOY_HELPER, "plan", timeout=120)
-        final["deploy_plan"] = {"ok": code == 0, "line": run.tag(outp, "PLAN") or run.last_line(outp), "output": outp[-3000:]}
+        final["deploy_plan"] = {"ok": code == 0, "line": run.tag(outp, "PLAN") or run.last_line(outp), "output": outp[-3000:],
+                                # B: read from the whole output (the kept tail may cut the list)
+                                "not_deployed": [x.strip() for x in NOT_DEPLOYED_RE.findall(outp)]}
         run.log("deploy plan: " + final["deploy_plan"]["line"])
     else:
         final["deploy_plan"] = {"ok": False, "line": "no deploy.json (manual deploy per the project docs)", "output": ""}
     # critical / high / medium findings: step 1 fixes, re-check, the other model verifies
     serious = [f for f in final["review"]["findings"] if str(f.get("severity", "")).lower() in ("critical", "high", "medium")]
-    if serious:
+    # C: a request item the reviewer found missing (not a plan non-goal) is a medium finding: the same fix path
+    missing = [x for x in final["review"].get("coverage") or [] if str(x.get("status", "")).lower() == "missing"]
+    if missing:
+        run.log(f"request coverage: {len(missing)} item(s) missing -> the final fix")
+    if serious or missing:
         write_prompts(run, "finalfix,finalverify")
         # step 1 fixes (as a Codex job when it is a Codex family); the fallback is a strong Claude that wrote none of
         # the code when one exists (the real authors, not the configured step 2), else the other Claude
@@ -1611,6 +1780,94 @@ def _phase_final(run, final):
     run.log(f"final: {final['status']}" + (f" - {final.get('reason', '')}" if final.get("reason") else ""))
 
 
+NONE_WORDS = {"", "none", "nothing", "-", "n/a", "na", "[]", "нищо", "няма"}
+NOT_DEPLOYED_RE = re.compile(r"not deployed \(run file left out of deploy\.json\): (.+)")
+
+
+def is_none_value(v):
+    v = str(v).strip().strip("*_` ").lower().rstrip(".")
+    return v in NONE_WORDS or bool(re.match(r"^(none|nothing|нищо|няма)\s*([(\-—,;.:]|$)", v))
+
+
+def gap_lines(path, key):
+    """B: the values of the `<key>: x` lines of an agent's report (recon `Unmapped:`, lens `Skipped:`), x not none."""
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return []
+    out = []
+    for ln in text.splitlines():
+        m = re.match(rf"^\s*(?:[-*>]\s*)?(?:\*\*|__)?{key}(?:\*\*|__)?\s*:\s*(?:\*\*|__)?\s*(.*)$", ln, re.I)
+        if m and not is_none_value(m.group(1)):
+            out.append(m.group(1).strip().strip("*_ ")[:200])
+    return out
+
+
+def coverage_block(run, final):
+    """B: what the run did NOT check, as the harness sees it at the end of the final review (harness-owned, kept in
+    state['final'] and archived with the generation; deploy.json is never edited). Gate B and REPORT.md print it,
+    coverage_questions() turns its deploy-relevant part into the questions c1-c3."""
+    tasks = run.state.get("tasks") or {}
+    recon = []
+    rdir = os.path.join(run.run_dir, "recon")
+    for name in sorted(os.listdir(rdir)) if os.path.isdir(rdir) else []:
+        if name.endswith(".md"):
+            recon += [f"{name[:-3]}: {x}" for x in gap_lines(os.path.join(rdir, name), "Unmapped")]
+    lenses = final.get("lenses") or {}
+    dp = final.get("deploy_plan") or {}
+    nd = dp.get("not_deployed")
+    if nd is None:   # a plan line kept before 17.10: read the plan output
+        nd = [x.strip() for x in NOT_DEPLOYED_RE.findall(dp.get("output") or "")]
+    return {"unchecked_by_task": {tid: [str(x) for x in o.get("unchecked")][:UNCHECKED_MAX] for tid, o in sorted(tasks.items())
+                                  if o.get("status") == "PASS" and o.get("unchecked")},
+            "lenses_skipped": lenses_skipped(run),
+            "lenses_dead": [] if final.get("short_circuit") else sorted(n for n, p in lenses.items() if not p),
+            "cap_hits": [f"{c.get('label')} ({c.get('cap')})" for c in run.calls() if c.get("cap")],
+            "not_deployed": nd,
+            "recon_unmapped": recon,
+            "lens_skips": [f"{n}: {x}" for n, p in sorted(lenses.items()) if p for x in gap_lines(p, "Skipped")]}
+
+
+def rel_key(run, p):
+    """A project-relative, lower-case key for a path from tasks.json or deploy.json (absolute or relative)."""
+    p = norm(p)
+    root = norm(run.project_dir or "").rstrip("/")
+    return p[len(root) + 1:] if root and p.startswith(root + "/") else p
+
+
+def coverage_questions(run, dep):
+    """B: the deploy-relevant gaps as harness-owned Gate B questions [(id, text)], one per category: c1 lenses with no
+    report after the retry, c2 run files deploy.json leaves out, c3 PASS tasks whose verifier did not check something
+    named after one of the task's own files that deploy.json uploads. Only when deploy.json uploads files and the
+    final review left a coverage block (an older state: no questions, the deploy works as before). The text names
+    the items, so a changed gap is a new question and an older yes no longer counts."""
+    cov = (run.state.get("final") or {}).get("coverage")
+    up = {rel_key(run, f.get("local", "") if isinstance(f, dict) else f) for f in dep.get("files") or []}
+    if not cov or not up:
+        return []
+    out = []
+    if cov.get("lenses_dead"):
+        out.append((COVERAGE_IDS["lenses"], "лещи без доклад и след втория опит (кодът не е минал през тях): "
+                    + ", ".join(cov["lenses_dead"]) + " - деплой без техния преглед?"))
+    nd = [p for p in cov.get("not_deployed") or [] if rel_key(run, p) not in up]
+    if nd:
+        out.append((COVERAGE_IDS["files"], "файлове на run-а, които deploy.json НЕ качва: " + ", ".join(nd)
+                    + " - деплой без тях (prod остава със старата им версия)?"))
+    plan = read_json(os.path.join(run.run_dir, "tasks.json"), {}) or {}
+    own = {t.get("id"): [rel_key(run, f.get("path", "")) for f in t.get("files") or []] for t in plan.get("tasks") or []}
+    hits = []
+    for tid, items in sorted((cov.get("unchecked_by_task") or {}).items()):
+        files = [f for f in own.get(tid) or [] if f in up]
+        for x in items:
+            low = str(x).lower()
+            if any(f in low or os.path.basename(f) in low for f in files):
+                hits.append(f"{tid}: {str(x)[:160]}")
+    if hits:
+        out.append((COVERAGE_IDS["unchecked"], "PASS задачи, чийто верификатор НЕ е проверил нещо по качван файл: "
+                    + "; ".join(hits) + " - деплой въпреки това?"))
+    return out
+
+
 def hard_stops(run, fetch_line=None):
     """The hard stops of SKILL section 8 that the harness can see (the rest is the orchestrator's judgement)."""
     stops = []
@@ -1651,8 +1908,14 @@ def hard_stops(run, fetch_line=None):
             stops.append(f"деплой на чувствителен файл: {p}")
     tok = deploy_candidate(run)
     for n, text, stale in unanswered_questions(run, dep):
-        line = f"неотговорен въпрос №{n} от deploy.json: {text} (отговор: `deploy --yes {n} --approved {tok or '<кандидат>'}`; --force не го покрива)"
-        if stale:
+        if str(n).startswith("c"):
+            line = (f"неотговорен въпрос {n} (покритие, harness): {text} (отговор: `deploy --yes {n} --approved "
+                    f"{tok or '<кандидат>'}`; --force не го покрива)")
+        else:
+            line = f"неотговорен въпрос №{n} от deploy.json: {text} (отговор: `deploy --yes {n} --approved {tok or '<кандидат>'}`; --force не го покрива)"
+        if stale and tok and stale.get("candidate") == tok:
+            line += f" - има „да“ от {stale.get('at')}, но за друг текст (пропуските са се променили)"
+        elif stale:
             line += f" - има „да“ от {stale.get('at')}, но за друг кандидат ({stale.get('candidate') or 'без token'}); сегашният е {tok}"
         stops.append(line)
     if fetch_line and ("conflict" in fetch_line.lower() or "FAIL" in fetch_line):
@@ -1685,8 +1948,9 @@ def deploy_candidate(run):
 
 
 def unanswered_questions(run, dep=None):
-    """deploy.json needs_yes items (1-based) without a yes for the CURRENT candidate: (n, text, stale answer or None).
-    A yes is recorded with the candidate token it was given for (`deploy --yes N --approved T`); after a new fetch
+    """deploy.json needs_yes items (1-based) without a yes for the CURRENT candidate: (n, text, stale answer or None),
+    then the harness's coverage questions (id c1-c3, coverage_questions) without a yes for this candidate and text.
+    A yes is recorded with the candidate token it was given for (`deploy --yes N|cN --approved T`); after a new fetch
     that produced another candidate (other merge, edited deploy.json, new attempt) it no longer counts."""
     dep = dep if dep is not None else (read_json(os.path.join(run.run_dir, "deploy.json"), {}) or {})
     answers = run.state.get("deploy_answers") or {}
@@ -1697,6 +1961,12 @@ def unanswered_questions(run, dep=None):
         if ans and tok and ans.get("candidate") == tok:
             continue
         open_items.append((i + 1, str(y), ans))
+    # B: the harness's coverage questions c1-c3 - a yes counts for this candidate AND this exact text
+    for cid, text in coverage_questions(run, dep):
+        ans = answers.get(cid)
+        if ans and tok and ans.get("candidate") == tok and ans.get("text") == text:
+            continue
+        open_items.append((cid, text, ans))
     return open_items
 
 
@@ -1706,6 +1976,48 @@ def deploy_state(run):
 
 def deploy_mutated(ds):
     return bool((ds.get("applied") or {}).get("go")) or any(r.get("attempted") for r in ds.get("files") or [])
+
+
+GATE_B_GAPS = 10   # B: the НЕПРОВЕРЕНО lines Gate B shows; REPORT.md has all of them
+
+
+def coverage_lines(run):
+    """B/C: the lines of the НЕПРОВЕРЕНО / ПРОПУСНАТО section, the deploy-relevant ones first. Empty for a state
+    from before 17.10 (no coverage block, no request coverage)."""
+    final = run.state.get("final") or {}
+    cov = final.get("coverage") or {}
+    L = []
+    if cov.get("lenses_dead"):
+        L.append("лещи без доклад и след втория опит: " + ", ".join(cov["lenses_dead"]))
+    if cov.get("not_deployed"):
+        L.append("файлове на run-а извън deploy.json (не се качват): " + ", ".join(cov["not_deployed"]))
+    for tid, items in (cov.get("unchecked_by_task") or {}).items():
+        L += [f"{tid} (PASS) - верификаторът не е проверил: {x}" for x in items]
+    fixed = final.get("finalfix") is not None
+    fv_pass = bool(((final.get("finalverify") or {}).get("verdict") or {}).get("pass"))
+    for x in (final.get("review") or {}).get("coverage") or []:
+        st = str(x.get("status", "")).lower()
+        if st in ("missing", "partial"):
+            line = (f"заявката, {'ЛИПСВА' if st == 'missing' else 'частично'}: {str(x.get('request_item', ''))[:200]}"
+                    + (f" ({str(x.get('where'))[:120]})" if x.get("where") else ""))
+            if st == "missing" and fixed:
+                line += " - подадена на финалната поправка (" + ("проверена: PASS" if fv_pass else "НЕ е потвърдена") + ")"
+            L.append(line)
+    L += [f"агент, спрян от таван: {x}" for x in cov.get("cap_hits") or []]
+    if cov.get("lenses_skipped"):
+        L.append("лещи, пропуснати от FAST (\"fast\": false): " + ", ".join(cov["lenses_skipped"]))
+    L += [f"леща, пропуснала: {x}" for x in cov.get("lens_skips") or []]
+    L += [f"recon, неразучено: {x}" for x in cov.get("recon_unmapped") or []]
+    return L
+
+
+def dismissed_line(d):
+    """D: one dismissed lens finding (a dict from review.json, or whatever the reviewer wrote)."""
+    if not isinstance(d, dict):
+        return f"- {str(d)[:300]}"
+    where = f"{d.get('file') or '?'}" + (f":{d.get('line')}" if d.get("line") not in (None, "") else "")
+    return (f"- [{d.get('severity') or '?'}] {d.get('lens') or '?'} {where} - {str(d.get('reason') or '')[:200]}"
+            + (f" (доказателство: {str(d.get('evidence'))[:200]})" if d.get("evidence") else ""))
 
 
 def report_text(run):
@@ -1763,6 +2075,17 @@ def report_text(run):
         L.append(f"- поправки от {final['finalfix'].get('by')}: {((final['finalfix'].get('result') or {}).get('summary') or '-')[:200]}; "
                  f"проверка от {(final.get('finalverify') or {}).get('by', '-')}: "
                  f"{'PASS' if ((final.get('finalverify') or {}).get('verdict') or {}).get('pass') else 'FAIL'}")
+    # B/C/D (17.10): what the run did not check, the request against the code, the lens findings the reviewer threw out
+    if final.get("coverage") is not None or "coverage" in rv:
+        L += ["", "## Непроверено / пропуснато", ""] + ([f"- {x}" for x in coverage_lines(run)] or ["- нищо отчетено"])
+    if "coverage" in rv:
+        L += ["", "## Покритие на заявката", ""] + ([f"- [{x.get('status') or '?'}] {str(x.get('request_item', ''))[:200]}"
+                                                     + (f" - {str(x.get('where'))[:160]}" if x.get("where") else "") for x in rv["coverage"]]
+                                                    or ["- прегледът не е записал покритие (review.json без `coverage`)"])
+    if "dismissed_missing" in rv:
+        L += ["", "## Отхвърлени находки на лещите", ""] + (
+            ["- ВНИМАНИЕ: review.json няма списък `dismissed` - не се вижда кои находки на лещите прегледът е отхвърлил"]
+            if rv.get("dismissed_missing") else ([dismissed_line(d) for d in rv.get("dismissed") or []] or ["- няма"]))
     blocked = [r for r in results if r.get("status") in ("BLOCKED", "BLOCKED_DEP", "INCOMPLETE")]
     if blocked:
         L += ["", "## BLOCKED и въпроси", ""] + [f"- {r['task']}: {r.get('reason', '')}" + (f" - {' | '.join(r.get('last_problems') or [])[:300]}" if r.get("last_problems") else "") for r in blocked]
@@ -1801,6 +2124,15 @@ def gate_b_text(run):
          f"{(final.get('review') or {}).get('verdict', '-')} -> {final.get('status', '-')} · разход: ${run.cost_total():.2f}", ""]
     if stops:
         L += ["Твърди стопове (бият DEPLOY):"] + [f"- {s}" for s in stops] + [""]
+    gaps = coverage_lines(run)   # B: what the run did not check (the cN questions above are its deploy-relevant part)
+    if gaps:
+        L += ["НЕПРОВЕРЕНО / ПРОПУСНАТО:"] + [f"- {x}" for x in gaps[:GATE_B_GAPS]] + (
+            [f"- (+{len(gaps) - GATE_B_GAPS} още в REPORT.md)"] if len(gaps) > GATE_B_GAPS else []) + [""]
+    rv = final.get("review") or {}
+    if rv.get("dismissed_missing"):
+        L += ["ВНИМАНИЕ: review.json няма списък `dismissed` - не се вижда кои находки на лещите прегледът е отхвърлил.", ""]
+    elif "dismissed_missing" in rv:
+        L += [f"Отхвърлени находки на лещите: {len(rv.get('dismissed') or [])} (REPORT.md)", ""]
     if final.get("short_circuit"):
         L += ["Лещите и финалният преглед са пропуснати (паднала финална проверка не може да стане CLEAN): поправи проверката / кода и "
               "`power_run.py continue`; ако искаш диагнозата върху падащото дърво: `power_run.py continue --diagnose`.", ""]
@@ -1861,6 +2193,34 @@ def run_to_gate_b(run):
 
 # ---------- commands ----------
 
+def probe_disallowed(claude):
+    """A: True when the installed claude CLI knows `--disallowedTools` (its `--help` names it). An older CLI would
+    reject the flag and kill every agent, so without it the agents run as before (SKILL.md §1 still binds the session)."""
+    env = dict(os.environ, PYTHONUTF8="1")
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    try:
+        p = subprocess.run(list(claude) + ["--help"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env, timeout=60, creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "--disallowedTools" in (p.stdout or "") + (p.stderr or "")
+
+
+def cli_probe_line(run):
+    return (f"agents run with --disallowedTools {DISALLOWED} (no workflow or fan-out of their own)"
+            if run.state.get("cli_disallowed_tools") else
+            "the claude CLI has no --disallowedTools: agents run without the Workflow/Agent block (SKILL.md §1 still applies)")
+
+
+def ensure_cli_probe(run):
+    """A: a state from before 17.10 has no probe result - probe once, keep it in the state, log it."""
+    if "cli_disallowed_tools" not in run.state:
+        run.state["cli_disallowed_tools"] = probe_disallowed(run.claude)
+        run.save()
+        run.log(cli_probe_line(run))
+
+
 def preflight(run, models):
     """V2-16: the executables every run needs, checked before any state, agent or edit. Returns the problems."""
     problems = []
@@ -1901,9 +2261,10 @@ def cmd_start(a):
         if getattr(a, s) not in allowed:
             sys.exit(f"{s} must be one of {allowed}")
     flags = {f.strip().upper() for f in (a.flags or "").split(",") if f.strip()}
-    bad = flags - {"START", "DEPLOY"}
+    bad = flags - {"START", "DEPLOY", "FAST"}
     if bad:
-        sys.exit(f"unknown flags {sorted(bad)}; allowed: START, DEPLOY")
+        sys.exit(f"unknown flags {sorted(bad)}; allowed: START, DEPLOY, FAST")
+    fast = bool(getattr(a, "fast", False) or "FAST" in flags)
     req_path = os.path.join(run.run_dir, "request.md")
     if a.request_file:
         with open(a.request_file, encoding="utf-8") as f:
@@ -1936,12 +2297,16 @@ def cmd_start(a):
     if problems:
         sys.exit("PREFLIGHT FAILED (no state written, no agent started, nothing edited):\n  - " + "\n  - ".join(problems))
     run.state = {"run_dir": run.run_dir, "project_dir": run.project_dir, "title": a.title or os.path.basename(run.run_dir),
-                 "flags": {"start": "START" in flags, "deploy": "DEPLOY" in flags}, "models": models, "codex_models": codex_models,
+                 "flags": {"start": "START" in flags, "deploy": "DEPLOY" in flags}, "fast": fast,
+                 "models": models, "codex_models": codex_models,
                  "agent_types": types, "started_at": now(), "tasks": {},
                  "refresh_quota": bool(a.refresh_quota),   # PERF-03: codex usage snapshots only on request
-                 "lenses": [{"name": n, "focus": f} for n, f in parse_items(a.lens)] or None}
+                 "lenses": [{"name": n, "focus": f} for n, f in parse_items(a.lens)] or None,
+                 "cli_disallowed_tools": probe_disallowed(run.claude)}   # A: probed once per run
+    run.set_parallel()   # FAST raises the slots; the state is known now and no agent has started
     run.save()
     run.log("start: " + echo_line(run) + f" · agent types: {', '.join(types.values())}")
+    run.log(cli_probe_line(run))
     first = open(req_path, encoding="utf-8").read().strip().splitlines()
     first = next((ln for ln in first if ln.strip() and not ln.startswith("#")), "the request")[:200]
     phase_recon(run, parse_items(a.recon, [("scope", f"everything the request touches: {first}")]))
@@ -1970,6 +2335,7 @@ def cmd_continue(a):
     run.hold("continue")
     if not run.state.get("phase"):
         sys.exit("no state: use `start`")
+    ensure_cli_probe(run)
     run.state["diagnose"] = bool(a.diagnose)   # PERF-02: one `continue` at a time - the full review on a failing tree
     if a.refresh_quota:
         run.state["refresh_quota"] = True      # PERF-03
@@ -2007,6 +2373,7 @@ def cmd_verify(a):
     run.hold("verify")
     if not run.state.get("args"):
         sys.exit("the run has no work state yet (no `ready`)")
+    ensure_cli_probe(run)
     phase_verify_only(run, a.tasks)
     print("verify-only done; `power_run.py continue` " + ("runs the released tasks, then the final review"
                                                         if run.state.get("phase") == "work" else "runs the final review"))
@@ -2074,9 +2441,14 @@ def cmd_deploy(a):
     run.hold("deploy")
     if run.state.get("phase") not in ("gate_b", "deploy", "done", "deploy_failed", "awaiting_watch"):
         sys.exit(f"the run is at phase {run.state.get('phase')}; the deploy comes after Gate B")
-    qs = {str(i): str(t) for i, t in enumerate((read_json(os.path.join(run.run_dir, "deploy.json"), {}) or {}).get("needs_yes") or [], 1)}
+    a.yes = [str(n).strip().lower() for n in a.yes or []]   # `--yes C2` is c2
+    dep0 = read_json(os.path.join(run.run_dir, "deploy.json"), {}) or {}
+    qs = {str(i): str(t) for i, t in enumerate(dep0.get("needs_yes") or [], 1)}
+    qs.update(coverage_questions(run, dep0))   # B: c1-c3, the harness's own questions (deploy.json is never edited)
     for n in a.yes or []:
         if str(n) not in qs:
+            if re.fullmatch(r"[cC]\d+", str(n)):
+                sys.exit(f"--yes {n}: no open coverage question {n} for this run (known: {', '.join(qs) or 'none'})")
             sys.exit(f"--yes {n}: deploy.json has no needs_yes item {n} (known: {', '.join(qs) or 'none'})")
     ds = deploy_state(run)
     if deploy_mutated(ds):
@@ -2121,7 +2493,8 @@ def cmd_deploy(a):
             sys.exit(f"deploy --yes refused: a yes is for one candidate - repeat with --approved {tok} (the CANDIDATE token of this fetch)")
         for n in a.yes:
             run.state.setdefault("deploy_answers", {})[str(n)] = {"text": qs[str(n)], "at": now(), "candidate": tok}
-            run.log(f"deploy: #THE_OPERATOR# answered yes to needs_yes {n} for candidate {tok}: {qs[str(n)][:100]}")
+            what = "coverage question" if str(n).startswith("c") else "needs_yes"
+            run.log(f"deploy: #THE_OPERATOR# answered yes to {what} {n} for candidate {tok}: {qs[str(n)][:100]}")
         run.save()
     stops = hard_stops(run, fetch_line if code != 0 else None)
     if code != 0:
@@ -2136,10 +2509,13 @@ def cmd_deploy(a):
         run.log("deploy --go refused: no --approved")
         sys.exit(f"deploy --go refused: it needs --approved {tok}, the CANDIDATE token of this fetch - #THE_OPERATOR#'s yes is for exactly that candidate "
                  "(a later fetch that merges a changed prod is another one)")
-    if unanswered_questions(run):
-        run.log("deploy --go refused: unanswered needs_yes")
-        sys.exit(f"deploy --go refused: deploy.json has unanswered needs_yes items for candidate {tok}; answer each with "
-                 f"`deploy --yes <n> --approved {tok}` (--force does not cover them)")
+    open_q = unanswered_questions(run)
+    if open_q:
+        ids = ", ".join(str(n) for n, _, _ in open_q)
+        run.log(f"deploy --go refused: unanswered questions {ids}")
+        sys.exit(f"deploy --go refused: unanswered questions for candidate {tok}: {ids} (deploy.json needs_yes items by number, "
+                 f"the harness's coverage questions as cN); answer each with `deploy --yes <n|cN> --approved {tok}` "
+                 "(--force does not cover them)")
     if stops and not a.force:
         run.log("deploy --go refused: hard stops")
         sys.exit(f"deploy --go refused: hard stops above need #THE_OPERATOR#'s explicit yes (then `deploy --go --force --approved {tok}`)")
@@ -2202,7 +2578,11 @@ def main():
     sp.add_argument("--step1", required=True, help="opus | fable | astra")
     sp.add_argument("--step2", required=True, help="sonnet | haiku | opus | fable | sol | luna | astra")
     sp.add_argument("--step3", required=True, help="opus | fable | astra")
-    sp.add_argument("--flags", default="", help="START,DEPLOY")
+    sp.add_argument("--flags", default="", help="START,DEPLOY,FAST")
+    sp.add_argument("--fast", action="store_true",
+                    help="the FAST profile (same as FAST in --flags): work/fix/area agents with --effort medium, recon and "
+                         "lenses on haiku, up to POWER_FAST_PARALLEL agents, config lenses with \"fast\": false skipped; "
+                         "verifier, final check, hard stops and Gate B unchanged")
     sp.add_argument("--recon", action="append", help="name=focus (one explorer each; default: one for the whole scope)")
     sp.add_argument("--lens", action="append", help="name=focus (default: the project's lenses, else domain + smoke)")
     sp.add_argument("--title")
@@ -2225,8 +2605,9 @@ def main():
     common(sp)
     sp.add_argument("--go", action="store_true")
     sp.add_argument("--force", action="store_true", help="with --go: past the hard stops, after #THE_OPERATOR#'s explicit yes")
-    sp.add_argument("--yes", action="append", type=int, metavar="N",
-                    help="#THE_OPERATOR#'s yes to needs_yes item N of deploy.json (repeatable; recorded in the run state with the candidate token)")
+    sp.add_argument("--yes", action="append", type=str, metavar="N|cN",
+                    help="#THE_OPERATOR#'s yes to needs_yes item N of deploy.json, or to the harness's coverage question cN of Gate B "
+                         "(repeatable; recorded in the run state with the candidate token)")
     sp.add_argument("--approved", metavar="ATTEMPT:HASH",
                     help="the CANDIDATE token of the last `deploy` output; required with --go, --force and --yes: the yes is for exactly that candidate")
     sp.add_argument("--claimed-by")

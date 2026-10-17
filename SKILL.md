@@ -6,7 +6,7 @@ description: POWER mode for a large task (plan with anchors and contracts, paral
 # POWER mode
 
 Protocol for a large task with maximum parallel work and minimum intervention from #THE_OPERATOR#. One skill for all projects
-under `d:\Claude\`; project specifics come from `## POWER` in the project's `CLAUDE.md`. This file is the core (read it
+in the workspace; project specifics come from the project's `.claude/power.json` (or a `## POWER` json block in its `CLAUDE.md`). This file is the core (read it
 whole); the details are in `reference/` and are read only in the phase they belong to:
 
 All messages to #THE_OPERATOR# are in Bulgarian; file contents, plans and reports follow the project rules.
@@ -17,8 +17,8 @@ All messages to #THE_OPERATOR# are in Bulgarian; file contents, plans and report
 | `reference/plan.md` | Gate A: what an executable plan is, a large plan by areas, the agent budgets |
 | `reference/workflow.md` | the loop of one task (statuses, BLOCKED cases, verify-only) when a result needs explaining |
 | `reference/deploy.md` | phase 6: `power_deploy.py` step by step, rollback, hard stops |
-| `reference/gates.md` | Gate A/B: what the messages hold and the `/compact` hint |
-| `reference/codex-config.md` | on a Codex step; on a new project: the `## POWER` json block |
+| `reference/gates.md` | Gate A/B: what the messages hold and the `/clear` hint |
+| `reference/codex-config.md` | on a Codex step; on a new project: the POWER config (`.claude/power.json` or the `## POWER` json block) |
 | `reference/setup.md` | new machine or `install --check` reports missing settings; sharing the skill |
 | `reference/session-path.md` | the fallback: the whole protocol run from the session (Workflow), when the harness cannot run |
 
@@ -36,9 +36,9 @@ agents are told so in their instructions, a model can ignore it, the harness che
 
 ## 1. Trigger, flags, session model
 
-The standalone word `POWER` in capitals at the start of the message (not POWERCasino, NADPower). Four forms,
-no model names in the command; `START` and `DEPLOY` only in capitals, so that the word "deploy" in the task text
-does not trigger them:
+The standalone word `POWER` in capitals at the start of the message (not part of a word such as SUPERPOWER). Four forms plus
+the optional word `FAST`, no model names in the command; `START`, `DEPLOY` and `FAST` only in capitals, so that the
+words "deploy" or "fast" in the task text do not trigger them:
 
 | Message | Plan approval (Gate A) | Deploy confirmation (Gate B) |
 |--|--|--|
@@ -46,6 +46,7 @@ does not trigger them:
 | `POWER START <task>` | no | yes |
 | `POWER DEPLOY <task>` | yes | no |
 | `POWER START DEPLOY <task>` | no | no |
+| `POWER … FAST <task>` | as above | as above; cheaper knobs for execution, recon and lenses (§2), verification and the stops unchanged |
 
 **The session is thin.** Every agent of the run is a headless `claude -p --agent power-* --model …` process started by
 `power_run.py` (7-8k start context, no CLAUDE.md, no memory); script checks and Codex jobs are plain subprocesses. The
@@ -54,6 +55,15 @@ to #THE_OPERATOR#, and runs the deploy command after their answer. Measured befo
 32-52% of a run's cost; now it is a few calls, so the session may stay on the model it is on (Opus is still the
 recommendation for the judgement at the gates). Nothing is planned, reviewed or summarized in the session itself.
 Only the fallback of `reference/session-path.md` (the Workflow run from the session) needs `/model opus` first.
+
+**POWER owns the turn** (ultracode precedence, 17.10). A message that starts with POWER runs by this protocol even
+when ultracode is on (the keyword in the message, `/effort ultracode`, `--effort ultracode`, settings
+`"ultracode": true`): ultracode is suspended for the run. The session only runs `power_run.py` and relays the gates;
+no Workflow or Agent tool of its own besides the documented fallback (`reference/session-path.md`), no
+`isolation: "worktree"`; the POWER caps, the model menu and `POWER_MAX_AGENTS` apply, not ultracode's sizes
+[external]. Every harness agent runs with `--disallowedTools Workflow,Agent`, so no agent opens a workflow or a
+fan-out of its own [code: probed once per run with `claude --help` and kept in the state; an older CLI without the
+flag runs the agents as before and the log says so].
 
 ## 2. Models: three steps
 
@@ -66,6 +76,11 @@ Only the fallback of `reference/session-path.md` (the Workflow run from the sess
 - `opus`, `sonnet`, `haiku`, `fable` point to the latest version. Astra (frontier), Sol (workhorse) and Luna (cheap)
   are Codex families (#THE_OPERATOR#'s ChatGPT plan, outside the Claude limit); `codex_task.py models` gives the slugs, never
   write them by hand. No choice: recon and lenses - Sonnet `effort low`; prod verification - Sonnet.
+- **`FAST`** (the optional third flag word, `--flags …,FAST` or `--fast`): no menu - Opus / Sonnet / Opus; the `work`,
+  `fix` and `area` agents run with `--effort medium`, recon and lenses on Haiku (`effort low` as before), up to
+  `POWER_FAST_PARALLEL` (8) agents at once, lenses marked `"fast": false` in `## POWER` are skipped. The verifier,
+  the final review, `check --all final`, the hard stops and Gate B are exactly as without it; a run whose state has no
+  `fast` is unchanged. The knobs: `reference/harness.md` → "FAST".
 - **Agent types** (`agents/`, passed as `--agent` by the harness): `power-reader` (recon, lenses), `power-verifier`
   (verifier, final verification), `power-executor` (plan, execution, fixes, finishing, final review); `power-runner`
   only in the fallback. `omitClaudeMd` + a hard `maxTurns`; project rules reach the agents via `rules` in the plan. The
@@ -105,7 +120,8 @@ Only the fallback of `reference/session-path.md` (the Workflow run from the sess
    POWER costs 8-10 agents fixed (recon, plan, lenses, review) and for such a request a normal session +
    `php-reviewer` (or the project reviewer) before deploy is 5-7× cheaper. #THE_OPERATOR# decides; with `START`/`DEPLOY` it
    is also said, but does not stop.
-2. **The menu.** `python "<skill>/codex_task.py" models`, then one AskUserQuestion with three questions (for every form):
+2. **The menu.** `python "<skill>/codex_task.py" models`, then one AskUserQuestion with three questions (for every form
+   except `FAST`, which takes Opus / Sonnet / Opus without a question):
    „Кой планира и проверява парчетата?" (header „План": Opus (Recommended) · Fable · Astra), „Кой изпълнява
    парчетата?" („Изпълнение": Sonnet (Recommended) · Haiku · Sol · Luna; Opus and Astra via „Other", the menu
    allows 4 options), „Кой прави финалния преглед и плана за
@@ -116,12 +132,12 @@ Only the fallback of `reference/session-path.md` (the Workflow run from the sess
    remove the option.
 3. **Run folder and request.** `<run>` = `<project>/docs/power/<YYYY-MM-DD>-<slug>/`, `<run>/request.md` (the task
    verbatim; the answers from item 1 and every later correction from #THE_OPERATOR# go into its section „Решения на #THE_OPERATOR#":
-   the planner reads the file, and after `/compact` the session reads it instead of remembering). Read the project's
+   the planner reads the file, and after `/clear` the fresh session reads it instead of remembering). Read the project's
    `CLAUDE.md`, `power_check.py config --project-dir <project>` (short; `--full` for the json) and the deploy docs only
    as far as the recon foci and the hooks need: the agents read the rest.
 4. **Start the harness** in the background (Bash `run_in_background`, timeout 600000; it may run for an hour):
 
-       PYTHONUTF8=1 python "<skill>/power_run.py" start --run-dir <run> --project-dir <project> --step1 <m> --step2 <m> --step3 <m> [--flags START,DEPLOY] --recon "<name>=<what to map>" [--recon …] [--lens "<name>=<focus>"] --title "<slug>"
+       PYTHONUTF8=1 python "<skill>/power_run.py" start --run-dir <run> --project-dir <project> --step1 <m> --step2 <m> --step3 <m> [--flags START,DEPLOY,FAST] --recon "<name>=<what to map>" [--recon …] [--lens "<name>=<focus>"] --title "<slug>"
 
    One `--recon` per focus (1-4; one for a small task); without `--lens` the lenses come from `## POWER`, else
    `domain` + `smoke`. The harness runs recon → plan (step 1) → `prepare` (one planner retry on errors) → `baseline` →
@@ -129,8 +145,9 @@ Only the fallback of `reference/session-path.md` (the Workflow run from the sess
    PRE-BROKEN or SUSPECT baseline checks (they stop even with `START`, the file says why).
 5. **Echo line** after the menu (the harness prints the same one at the top of every file): `POWER START · план Opus ·
    изпълнение Sonnet · финал Opus · одобрение на плана: не · потвърждение на деплоя: да`, with the shifts per §2
-   („ескалация Fable (автоматично: Opus е и изпълнител)").
-6. CLAIM, if the project has one (`claim` in `## POWER`; for example `.project/SESSIONS.md`); the files are added
+   („ескалация Fable (автоматично: Opus е и изпълнител)"); with `FAST` the first word is `POWER START FAST` and the line
+   ends with `FAST: изпълнение effort medium, recon/лещи Haiku, паралел 8`.
+6. CLAIM, if the project has one (`claim` in `## POWER`; for example `.project/CLAIMS.md`); the files are added
    from „Файлове за CLAIM" in `gate_a.md`. The CLAIM line is the only project file the session writes.
 7. While the harness runs: `power_run.py status --run-dir <run>` (phase, tasks, running agents, cost, next step; also
    `<run>/harness/status.json` and `log.txt`); say where it is about every 15 minutes, never ask „до къде си".
@@ -140,10 +157,12 @@ Only the fallback of `reference/session-path.md` (the Workflow run from the sess
 1. When the harness stops at `gate_a` (the background task ends, or `status` says so): read `<run>/harness/gate_a.md`
    and relay it to #THE_OPERATOR# as it is (table of tasks, contracts, non-goals, risks, QUESTION risks, baseline decisions,
    expected agents, the CLAIM files, the closing „#THE_OPERATOR#, трябва да решиш …"). What an executable plan is and why,
-   and what `prepare` and `baseline` complain about: `reference/plan.md`. A plan above 50 agents: say so.
+   and what `prepare` and `baseline` complain about: `reference/plan.md`. A plan above 50 agents: say so. With 3+
+   earlier runs in the same folder the gate also has an indicative cost line (median per role and model from their
+   `harness/calls.jsonl`, range p25-p75, plus what recon and plan already spent; Codex is quota, not $) [code].
 2. **Gate A** (only without `START`): wait for „да". Changes by #THE_OPERATOR#: edit `tasks.json` by hand, or put the
    answers in `request.md` („Решения на #THE_OPERATOR#") and run `continue --replan` (the planner again, then
-   `prepare` → `baseline` → a new `gate_a.md`). Above 150k context: the `/compact` hint from `reference/gates.md`.
+   `prepare` → `baseline` → a new `gate_a.md`). Above 150k context: the `/clear` hint from `reference/gates.md`.
 3. On „да": `PYTHONUTF8=1 python "<skill>/power_run.py" continue --run-dir <run> --project-dir <project>` in the
    background. It runs `ready` (prepare → snapshot → prompts → args, the snapshot as fresh as possible), the work loop,
    the final review and the report, and stops at `gate_b`.
@@ -176,13 +195,19 @@ the snapshot (its half edit kept in `stash/`) and redone, nothing else is repeat
    `continue --diagnose` runs the full review on the failing tree when the diagnosis itself is wanted. When it passes,
    the lenses run in parallel - they read its diff and report (`power-reader`,
    Sonnet, `effort low`; a lens with `agent_type` in `## POWER`, e.g. `php-reviewer`, runs as that type). They write
-   `<run>/review/<name>.md`.
+   `<run>/review/<name>.md`, ending with a `Skipped:` line [prompt]; a lens that leaves no report gets one retry
+   (counted under `POWER_MAX_AGENTS`, skipped when the cap is near) [code].
 2. The final reviewer (step 3, shifted per §2 when it is also the executor; Astra via `codex_task.py review`)
    confirms every finding against the code and writes `REVIEW.md`, `DEPLOY.md`, `deploy.json`, `review.json`;
-   `power_deploy.py plan` validates `deploy.json` right away.
-3. Critical/high/medium findings: step 1 fixes (`finalfix`, all files of the run, nothing else) → `check --all --round
-   final2` → the „not the author" verifier (`finalverify`). Still failing - BLOCKED in the report (`final.status`).
-   Low - in the report.
+   `power_deploy.py plan` validates `deploy.json` right away. Lenses and reviewer grade by one severity rubric
+   (high = wrong money/stock/status, an auth or role leak, injection, data loss, a regression on every page or for a
+   whole role; medium = a wrong result in a realistic path; low = cosmetic or hypothetical) [prompt]. The reviewer
+   also reads `request.md` („Решения на #THE_OPERATOR#") and the plan's non-goals and writes `coverage[]` (request item →
+   done / partial / missing / out_of_scope_by_plan) and `dismissed[]` (every lens finding it threw out, with the
+   reason and the evidence) [prompt; a missing `dismissed` is a warning at Gate B, code].
+3. Critical/high/medium findings, and every request item with status `missing` (a medium finding) [code]: step 1
+   fixes (`finalfix`, all files of the run, nothing else) → `check --all --round final2` → the „not the author"
+   verifier (`finalverify`). Still failing - BLOCKED in the report (`final.status`). Low - in the report.
 
 ## 7. Phase 5: summary and Gate B
 
@@ -195,12 +220,21 @@ lines by role, from `harness/calls.jsonl`; the deploy plan, DB steps, `needs_yes
 `<run>/harness/gate_b.md`.
 Relay `gate_b.md` to #THE_OPERATOR#; REPORT.md is linked, not pasted.
 
+**What the run did not check** [code, 17.10]: `gate_b.md` has a section „НЕПРОВЕРЕНО / ПРОПУСНАТО" (at most 10 lines,
+the rest in REPORT.md): what each passing verifier says it did not check (`unchecked`), lenses dead after the retry
+or skipped by FAST, agents a turn or budget cap stopped, run files `deploy.json` leaves out, the lenses' `Skipped:` and
+recon's `Unmapped:` lines, the request items the reviewer found missing or partial; plus the count of dismissed lens
+findings. The gaps that matter for the deploy are the harness's own questions, hard stops until answered: `c1` lenses
+with no report, `c2` run files not deployed, `c3` a PASS task whose verifier did not check something about a file
+`deploy.json` uploads → `deploy --yes cN --approved <token>` (bound to the candidate and to the exact text; `--force`
+does not cover them). `deploy.json` is never edited by the harness.
+
 **Partial deploy** (there is a BLOCKED): `gate_b.md` already asks it explicitly („Качвам t1, t2, t4-t6 без t3?"); the
 PASS tasks with no dependency on BLOCKED (`depends_on` and contracts). Before it: `restore --task <id> --keep blocked`
 for BLOCKED, `check --tasks <PASS> --round partial` + local smoke, step 3 reviews the reduced diff (an Agent
 `power-executor` with the review prompt, or the harness again on a reduced `tasks.json` in a new run).
 
-**Gate B** (only without `DEPLOY`): wait for #THE_OPERATOR#'s answer; before it the `/compact` hint per `reference/gates.md`
+**Gate B** (only without `DEPLOY`): wait for #THE_OPERATOR#'s answer; before it the `/clear` hint per `reference/gates.md`
 if the context is above 150k.
 
 ## 8. Phase 6: deploy
@@ -265,7 +299,11 @@ there is no deploy, after `watch` ends `HEALTHY` when there is one. No flag turn
 3. Never `push`, never `stash`/`checkout`/`reset`/`rebase`, never with a BLOCKED or INCOMPLETE task (a partial
    deploy commits only the deployed PASS tasks and says so in the message), never with a `conflict` left in the
    working tree. A refused or failed commit is reported as `HARNESS COMMIT: <reason>`, not retried silently.
-4. The commit hash goes into `REPORT.md` and the SESSIONS.md hand-off.
+4. The commit hash goes into `REPORT.md` and the project's hand-off file.
+5. Temp cleanup (also when the commit is skipped): the session deletes the scratch the run left outside
+   `docs/power/<run>/` (fetched pages, shots, patches, `_tmp_*` files in `_temp/`, the system temp folder, the scratchpad) with
+   the project's cleanup tool when its `CLAUDE.md` names one, dry list read first. The run folder, `deploy/`
+   prod-before copies and anything another CLAIM holds stay.
 
 ## 10. Never in POWER
 
@@ -283,8 +321,12 @@ there is no deploy, after `watch` ends `HEALTHY` when there is one. No flag turn
   check report]; a check has not "passed" without a report from `power_check.py` [code].
 - Code is not verified or finally reviewed by the model that wrote it, by the REAL authors in `results.json` [code:
   `verifier_for`, `escalate_model(author)`, `review_choice`; no independent strong model left = hard stop].
-- No deploy with an unanswered question, even with `START DEPLOY` [code: `needs_yes` → `--yes N --approved`], and no
-  deploy of a candidate #THE_OPERATOR# did not see [code: `--approved <attempt:hash>`].
+- No deploy with an unanswered question, even with `START DEPLOY` [code: `needs_yes` → `--yes N --approved`, the
+  coverage questions → `--yes cN --approved`], and no deploy of a candidate #THE_OPERATOR# did not see [code:
+  `--approved <attempt:hash>`].
+- No ultracode inside a POWER run: no Workflow/Agent fan-out of the session's own besides the fallback, no worktree
+  isolation, no ultracode sizes [external]; no Workflow or Agent tool for a harness agent [code:
+  `--disallowedTools`, §1].
 - No agent without a call cap or without a type from `agents/` [code for Claude agents: preflight, `--max-turns`,
   budget; Codex jobs: sandbox, schema, `JOB_TIMEOUT` - their tool-call budget is prompt only; the cap inside the
   prompt is prompt]; no agent at all without the executables (`start` preflights `claude`, `git`, Git Bash and the
@@ -296,3 +338,7 @@ there is no deploy, after `watch` ends `HEALTHY` when there is one. No flag turn
 - The harness is not resumed by restarting `start` (it refuses while a state exists; `start --force` wipes the state,
   not the files): `continue` picks up where it stopped [code]. One harness process per run (`run.lock`), and
   `POWER_MAX_AGENTS` stops a run that grows past the cap with INCOMPLETE, never with a fake PASS [code].
+
+---
+
+Version 0.2 · Credits: Dragomir Dragolov, Digital Media JSC, https://dmedia.bg

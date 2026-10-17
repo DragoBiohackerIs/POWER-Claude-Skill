@@ -1,5 +1,7 @@
 # POWER - Multi-Agent Mode for Large Tasks in Claude Code
 
+**Version 0.2**
+
 > **Before the first run:** replace `#THE_OPERATOR#` with your name in all files. See [Adapting to another user or workspace](#adapting-to-another-user-or-workspace).
 
 POWER is a Claude Code skill that takes one large change (a feature across many files, a refactor, a batch of
@@ -12,7 +14,28 @@ The session you type in stays thin. The work is done by headless `claude -p` pro
 (`power_run.py`), each with a small start context, a hard call cap and a dollar budget. Code is never verified by
 the model that wrote it.
 
-Snapshot of the skill as of 2026-10-14, after three hardening reviews by Astra (harness v3, review v3 stages A+B): deploy lifecycle with
+How it compares with ultracode and a normal session, with measured costs: [POWER vs ultracode vs a normal session](#power-vs-ultracode-vs-a-normal-session).
+
+Snapshot of the skill as of 2026-10-17. New since the first public snapshot (2026-10-14):
+
+- **`FAST`**: an optional trigger word for cheaper execution, recon and lenses (Opus / Sonnet / Opus without the
+  menu, the executors at `--effort medium`, recon and lenses on Haiku, up to 8 agents at once); verification, the
+  final review, the hard stops and Gate B are unchanged.
+- **Project config in `.claude/power.json`**: the same keys as the `## POWER` block of `CLAUDE.md`, without loading
+  them into every session's context.
+- **`/clear` instead of `/compact` at the gates**: above 150k context the session writes a hand-off and a fresh
+  session continues the run from its files.
+- **POWER owns the turn**: a POWER message runs by this protocol even when ultracode is on, and every harness agent
+  runs with `--disallowedTools Workflow,Agent`, so no agent opens a workflow or a fan-out of its own.
+- **What the run did not check**: Gate B lists the gaps (lenses with no report, run files the deploy leaves out, what
+  each passing verifier did not check, request items the final review found missing or partial); the gaps that
+  matter for the deploy are hard stops until answered (`deploy --yes cN`).
+- **Request coverage and dismissed findings**: the final reviewer maps every request item to done / partial /
+  missing / out of scope and lists every lens finding it threw out, with the evidence; a missing item goes to the
+  final fix. Lenses and reviewer grade by one severity rubric; a lens with no report gets one retry.
+- **Cost forecast at Gate A**: with 3+ earlier runs in the same folder, an indicative range from their call logs.
+
+Earlier hardening, three reviews by Astra (harness v3, review v3 stages A+B): deploy lifecycle with
 verified rollback and a sealed candidate per approval token (file bytes, backups, `deploy.json` AND the effective
 profile), prod re-check of every row before the first write, backup digests, required/optional `after` hooks
 (`AFTER_FAILED` is not a deploy), one dispatcher for Claude and Codex agents with real-author provenance (verifier,
@@ -37,7 +60,7 @@ fallback carries the same outcome rules where a script can (`reference/workflow.
 | `power_workflow.js` | The in-session Workflow (fallback path when the harness cannot run) |
 | `agents/*.md` | Four agent types: `power-reader`, `power-executor`, `power-verifier`, `power-runner` |
 | `reference/*.md` | Phase-specific details, read only when the phase needs them (see the table in `SKILL.md`) |
-| `tests/` | Offline test suite: a fake `claude` (`mock_claude.py`), a fake Codex helper (`mock_codex.py`), a controllable deploy transport (`fake_transport.py`); 41 harness scenarios + 18 deploy scenarios (all offline) |
+| `tests/` | Offline test suite: a fake `claude` (`mock_claude.py`), a fake Codex helper (`mock_codex.py`), a controllable deploy transport (`fake_transport.py`); 47 harness scenarios (384 checks) + 18 deploy scenarios (216 checks), all offline |
 
 ---
 
@@ -104,6 +127,72 @@ lenses, review); a normal session plus one reviewer agent is cheaper there. The 
 
 ---
 
+## POWER vs ultracode vs a normal session
+
+Claude Code gives you three ways to take on a large change. They are not rivals: each one fits a different job.
+
+- **Normal session.** You type, Claude edits, you steer turn by turn. It is the cheapest choice for 1-3 small tasks.
+  The model that writes the code also judges it, and the whole job lives in one context that keeps growing.
+- **Ultracode** (`ultracode` in a prompt, `/effort ultracode`, or `"ultracode": true` in settings). Claude plans a
+  dynamic workflow of subagents for each substantial task. It is the strongest choice for open questions: audits,
+  research, design comparisons, "find everything that...". Anthropic's launch post warns that dynamic workflows "can
+  consume substantially more tokens than a typical Claude Code session". A run has no dollar ceiling, and while
+  ultracode is on the "Large workflow" warning is suppressed.
+- **POWER.** A fixed pipeline driven from Python code: recon, an executable plan you approve, parallel executors,
+  script checks, a verifier that did not write the code, a final review and a gated deploy. Every agent starts small
+  (~7-8k tokens: no `CLAUDE.md`, no memory) with a call cap and a dollar budget, and every call is logged with its
+  cost.
+
+| | Normal session | Ultracode | POWER |
+|--|--|--|--|
+| Who orchestrates | You, turn by turn | The model, by writing a workflow for each task | A Python harness, from code; the session only relays two gates |
+| The plan | In the chat | Decided by the model at run time | Written and executable: a closed file list per task, anchors, contracts, checks; you approve it (Gate A) |
+| Who verifies | The model that wrote the code, unless you ask for a reviewer | Whatever verification the model puts in its workflow | Always a different model, working from the diff and a script check report, never from the author's summary |
+| Scope control | You read the diff | Not enforced | An edit outside the file list is BLOCKED or SUSPECT; a plan that does not match the code stops with `PLAN_MISMATCH` |
+| Cost control | Your judgement | Your plan's usage limit | Call cap and `--max-budget-usd` per agent, `POWER_MAX_AGENTS` per run, cost by role in `REPORT.md` |
+| After a crash | The context is gone | Resume in the same session (`resumeFromRunId`) | `continue` resumes any phase; finished tasks are kept |
+| Deploy | By hand | Not covered | Prod backup, merge with prod, canaries, one approval token per candidate, verified rollback |
+| What stays on disk | The transcript | The result in the chat | `PLAN.md`, `REPORT.md`, `results.json`, `calls.jsonl` (every call with its cost) |
+| Use it for | 1-3 small tasks | Analysis, audits, research, design questions | 4+ tasks that must ship: features, refactors, batches |
+
+### Real numbers
+
+All figures were measured on one workspace in October 2026 and are API-equivalent dollars. On a Max plan they are
+usage against your limit, not a bill. POWER rows: the `total_cost_usd` that Claude Code reports for every agent. The
+other rows: token logs priced at list rates (Opus 5.5 $4/$20, Sonnet 5.5 $2/$10, Fable 5.1 $10/$50 per 1M
+input/output tokens, 1-hour cache writes), prices checked against the POWER figures.
+
+| Job | Approach | Agents | Cost |
+|--|--|--|--|
+| One focused change per session (a fix, a cron entry, a deploy) | Normal session, Opus 5.5 | 0-2 | $1.40-7.10 per session (10 sessions, one day) |
+| Read-only analysis "should POWER use ultracode?": 15 past runs mapped, 14 ideas x 3 checks, a critic | Ultracode workflow | 47 | ~$30 (agents $24.55 + session $5.29), 52 min |
+| Admin UI redesign, 4 tasks | POWER | 25 | $14.66 |
+| Statistics page, 4 tasks | POWER | 16 | $17.64 |
+| Nightly health checks, 11 tasks | POWER | 62 | $41.40 |
+| Nightly shop hygiene, 12 tasks | POWER | 54 | $47.84 |
+| Support KB triage, 20 tasks (first live run, 20/20 PASS) | POWER | 44 | $59.94 |
+| Affiliate module, 17 tasks | POWER | 72 | $68.56 |
+
+A POWER figure covers every agent of the run: recon, plan, work, verification, fixes, lenses and the final review.
+The thin session adds a few calls on top.
+
+What the numbers say:
+
+- **A small job belongs in a normal session.** POWER's fixed part (recon, plan, lenses, final review) was $7.11 of
+  the $14.66 4-task run. For 1-3 tasks a normal session at $1.40-7.10 wins, and POWER says so at intake.
+- **Ultracode spends freely.** One read-only analysis cost ~$30. That is about twice a complete 4-task POWER build
+  ($14.66), which was planned, executed, independently verified, reviewed and ready to deploy.
+- **Uncapped agents are the real risk.** On one day, three exploration subagents started from a normal session (108-145
+  tool calls each, 500k context) cost $27, more than that whole 4-task POWER run. A POWER explorer has a hard call cap
+  and a budget.
+- **Where POWER spends.** Verification is 33-55% of every run: the price of never trusting the author's own account.
+  The final review still found a medium-severity defect in 3 of the 6 runs above, such as a KPI that was wrong for
+  every period but one.
+- **How POWER scales.** About $3-4.50 per task, everything included: 4 tasks ~$15-18, 11-12 tasks ~$41-48, 17-20
+  tasks ~$60-69.
+
+---
+
 ## Installation
 
 Requirements: Claude Code with custom agent types (`omitClaudeMd`, `maxTurns`), `claude` on PATH, Python 3,
@@ -133,12 +222,13 @@ Git Bash on Windows. Codex CLI is optional.
        PYTHONUTF8=1 python "<skill>/tests/test_power_run.py"
        PYTHONUTF8=1 python "<skill>/tests/test_power_deploy.py"
 
-   On non-Windows the test projects go to `/tmp/prun_test`; override with `POWER_TEST_ROOT`.
+   The test projects go to `<system temp>/prun_test`; override with `POWER_TEST_ROOT`.
 
 ### Project configuration (optional)
 
-Add a `## POWER` section with one `json` block to the project's `CLAUDE.md`. Without it POWER still runs with the
-general rules and a manual deploy. Full key reference: `reference/codex-config.md`.
+Put one json object in the project's `.claude/power.json`, or a `## POWER` section with one `json` block in its
+`CLAUDE.md` (the file keeps the config out of every session's context; both in one directory is an error). Without
+it POWER still runs with the general rules and a manual deploy. Full key reference: `reference/codex-config.md`.
 
 ```json
 {"deny": ["**/generated/**", "vendor/**"],
@@ -147,7 +237,7 @@ general rules and a manual deploy. Full key reference: `reference/codex-config.m
    {"name": "smoke", "focus": "local stack http://localhost:8080: login and the touched routes, never a 500"}
  ],
  "smoke": ["docker exec app php -l /var/www/html/index.php"],
- "claim": ".project/SESSIONS.md",
+ "claim": ".project/CLAIMS.md",
  "deploy": {"profiles": {
    "app": {"local_root": "src",
            "remote_root": "/home/acct/app",
@@ -172,8 +262,8 @@ general rules and a manual deploy. Full key reference: `reference/codex-config.m
 
 ### The four trigger forms
 
-Start the message with `POWER` in capitals. `START` and `DEPLOY` also only in capitals, so the word "deploy" inside
-the task text does not trigger anything.
+Start the message with `POWER` in capitals. `START`, `DEPLOY` and the optional `FAST` also only in capitals, so the
+words "deploy" or "fast" inside the task text do not trigger anything.
 
 | Message | Plan approval (Gate A) | Deploy confirmation (Gate B) |
 |--|--|--|
@@ -181,8 +271,10 @@ the task text does not trigger anything.
 | `POWER START <task>` | no | yes |
 | `POWER DEPLOY <task>` | yes | no |
 | `POWER START DEPLOY <task>` | no | no |
+| `POWER … FAST <task>` (any form + `FAST`) | as above | as above; cheaper execution, recon and lenses; verification and the stops unchanged |
 
-No model names in the command: a menu asks every time.
+No model names in the command: a menu asks every time, except with `FAST` (Opus / Sonnet / Opus, the executors at
+`--effort medium`, recon and lenses on Haiku, up to 8 agents at once).
 
 ### The model menu
 
@@ -199,7 +291,7 @@ verifier and the escalation shift automatically to the other strong model, and t
 ### Example 1 - standard run with both gates
 
     POWER Add a "Return requested" order status to the admin: migration, model, list filter,
-    detail page badge, and an ActivityLog entry on change. EN + BG labels.
+    detail page badge, and an audit log entry on change. EN + BG labels.
 
 What happens:
 
@@ -282,6 +374,7 @@ Run folder: `<project>/docs/power/<YYYY-MM-DD>-<slug>/`
 | Variable | Default | Effect |
 |--|--|--|
 | `POWER_MAX_PARALLEL` | 6 | agent processes at once |
+| `POWER_FAST_PARALLEL` | 8 | agent processes at once with `FAST` |
 | `POWER_MAX_AGENTS` | 0 | cap on the agents one run may start (0 = none); at the cap the run stops with INCOMPLETE tasks, raise it and `continue` |
 | `POWER_AGENT_TIMEOUT` | 3600 | seconds per agent before it counts as dead |
 | `POWER_BUDGET_SCALE` | 1.0 | multiplies the per-role dollar caps; 0 removes them |
@@ -307,13 +400,16 @@ the agents are told so, a model can ignore it; **external** = the session or you
   report); a check has not passed without a `power_check.py` report (code).
 - Code is never verified or finally reviewed by the model that really wrote it (code, after Codex fallbacks and
   escalation too; no independent strong model left = hard stop).
-- No deploy with an unanswered question, even with `START DEPLOY` (code: `--yes N --approved`), and no deploy of a
-  candidate you did not see (code: `--approved attempt:hash` over the bytes, backups, `deploy.json` and the effective
-  profile; every prod row re-checked before the first write; a hand resolution is sealed into a new candidate).
+- No deploy with an unanswered question, even with `START DEPLOY` (code: `--yes N --approved`; the coverage questions
+  c1-c3 about unreviewed or undeployed files: `--yes cN --approved`), and no deploy of a candidate you did not see
+  (code: `--approved attempt:hash` over the bytes, backups, `deploy.json` and the effective profile; every prod row
+  re-checked before the first write; a hand resolution is sealed into a new candidate).
 - A failed required `after` hook, a rollback or an unhealthy watch is never a completed deploy (code: `AFTER_FAILED`,
   `ROLLED_BACK*`, exit 2, phase `deploy_failed`).
 - One harness process per run, every Claude agent with a type and a hard call cap (Codex jobs: sandbox + timeout), an
   optional cap on agents per run, no agent without the executables (code).
+- No ultracode inside a run: a POWER message suspends it, the session opens no workflow or fan-out of its own besides
+  the documented fallback (external), and every harness agent runs with `--disallowedTools Workflow,Agent` (code).
 - Judging a merged diff, running DB `apply` steps after a yes (`watch --db-rollback` runs only their rollback),
   deciding a partial deploy, verifying prod afterwards (external).
 
@@ -324,16 +420,24 @@ the agents are told so, a model can ignore it; **external** = the session or you
 This skill was extracted from a working setup. Before the first run:
 
 - **Replace `#THE_OPERATOR#` with your own name.** It marks the human who approves the plan and the deploy. It
-  appears in the scripts, the gate messages, `SKILL.md` and `reference/`. Find every place with:
+  appears in the scripts, the gate messages, the tests, `SKILL.md` and `reference/`. Find every place with:
 
       grep -rn "#THE_OPERATOR#" .
 
 - The gate messages, the menu and the closing lines are in **Bulgarian** (`power_run.py`, `SKILL.md`,
-  `reference/gates.md`, `reference/session-path.md`). Translate them if needed. `tests/test_power_run.py` checks one
+  `reference/gates.md`, `reference/session-path.md`). Translate them if needed. `tests/test_power_run.py` checks many
   of these strings, so update it together with `power_run.py`.
-- `SKILL.md` mentions `d:\Claude\` as the workspace root; it only describes where project `CLAUDE.md` files live.
+- The `/clear` hint at the gates (`reference/gates.md`) expects a hand-off file in the project and a rule in your
+  global `CLAUDE.md` that a bare „да" after `/clear` resumes from it. Without that rule, point the fresh session at
+  the hand-off yourself.
 - The tests write to `<system temp>/prun_test` (`POWER_TEST_ROOT` overrides it).
 - No secrets, tokens or project data are included.
+
+---
+
+## Credits
+
+Dragomir Dragolov, Digital Media JSC, https://dmedia.bg
 
 ---
 
@@ -343,6 +447,6 @@ Copyright Dragomir Dragolov. Licensed under the [PolyForm Noncommercial License 
 
 - **Free** for personal use, hobby projects, study, research and other noncommercial purposes.
 - **Credit is required:** keep the `Required Notice` line from `LICENSE.md` in every copy or fork, and link back to
-  this repository.
+  [this repository](https://github.com/DragoBiohackerIs/POWER-Claude-Skill).
 - **Commercial use** (inside a company, for paying clients, or in a paid product or service) needs a separate
   commercial license. Open an issue in this repository to ask for one.

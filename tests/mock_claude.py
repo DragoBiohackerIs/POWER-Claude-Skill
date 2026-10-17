@@ -24,6 +24,13 @@ def opt(name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
 
 
+if "--help" in args:
+    # the harness probes the CLI once per run (stdin is closed); MOCK_OLD_CLI=1 is a CLI without --disallowedTools
+    print("Usage: claude [options] [command] [prompt]\n\nOptions:\n  -p, --print  print the response and exit\n"
+          + ("" if os.environ.get("MOCK_OLD_CLI") == "1" else
+             "  --disallowedTools, --disallowed-tools <tools...>  Comma or space-separated list of tool names to deny\n"))
+    sys.exit(0)
+
 prompt = sys.stdin.read()
 scen = json.load(open(os.environ["MOCK_SCENARIO"], encoding="utf-8"))
 state_path = os.environ["MOCK_STATE"]
@@ -78,7 +85,7 @@ try:
     state["calls"].append({"kind": kind, "name": name, "agent": opt("--agent"), "model": opt("--model"),
                            "turns": opt("--max-turns"), "effort": opt("--effort"), "budget": opt("--max-budget-usd"),
                            "perm": opt("--permission-mode"), "cwd": os.getcwd().replace("\\", "/"), "index": idx,
-                           "inline": inline, "prompt_chars": len(prompt)})
+                           "inline": inline, "prompt_chars": len(prompt), "disallowed": opt("--disallowedTools")})
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1)
 finally:

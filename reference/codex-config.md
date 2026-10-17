@@ -33,9 +33,9 @@ deploy profile the deploy is manual.
 ```json
 {"deny": ["**/generated/**"],
  "allow": [],
- "lenses": [{"name": "domain", "agent_type": "php-reviewer", "focus": "escaping, ActivityLog, cold-chain"}],
+ "lenses": [{"name": "domain", "agent_type": "php-reviewer", "focus": "escaping, audit log, business rules"}],
  "smoke": ["MSYS_NO_PATHCONV=1 docker exec <container> php -l /var/www/html/index.php"],
- "claim": ".project/SESSIONS.md",
+ "claim": ".project/CLAIMS.md",
  "deploy": {"profiles": {
    "shop": {"local_root": "my-plugin",
             "remote_root": "/home/<acct>/<docroot>/wp-content/plugins/my-plugin",

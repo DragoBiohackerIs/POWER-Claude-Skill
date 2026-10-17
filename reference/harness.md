@@ -18,7 +18,7 @@ access.
 
 | Command | What it does | Stops at |
 |--|--|--|
-| `start --run-dir R --project-dir P --request-file F --step1 --step2 --step3 [--flags START,DEPLOY] [--recon n=focus …] [--lens n=focus …] [--title T] [--refresh-quota]` | preflight before any state, agent or edit (the agent types; `claude` = `POWER_CLAUDE` or PATH, `git`, Git Bash, the helper scripts, a valid `## POWER` json block (V3-06), and with a Codex model the codex executable + the login `auth.json` under `CODEX_HOME` without a paid probe (V3 readiness): `PREFLIGHT FAILED` names the fix, V2-16), writes `request.md` (if missing), recon agents in parallel, the planner, `prepare` (one planner retry with the errors), `RECON:` risks → one more explorer and a revised plan, `baseline`, `harness/gate_a.md`; two planners without a plan (dead, or no PLAN.md + tasks.json) = phase `plan_failed`, exit 2, a gate_a.md that names the cause and `continue --replan`, no traceback | Gate A; with `START` it continues, except on `QUESTION:` risks, PRE-BROKEN or SUSPECT checks |
+| `start --run-dir R --project-dir P --request-file F --step1 --step2 --step3 [--flags START,DEPLOY,FAST] [--fast] [--recon n=focus …] [--lens n=focus …] [--title T] [--refresh-quota]` | preflight before any state, agent or edit (the agent types; `claude` = `POWER_CLAUDE` or PATH, `git`, Git Bash, the helper scripts, a valid `## POWER` json block (V3-06), and with a Codex model the codex executable + the login `auth.json` under `CODEX_HOME` without a paid probe (V3 readiness): `PREFLIGHT FAILED` names the fix, V2-16), writes `request.md` (if missing), recon agents in parallel, the planner, `prepare` (one planner retry with the errors), `RECON:` risks → one more explorer and a revised plan, `baseline`, `harness/gate_a.md`; two planners without a plan (dead, or no PLAN.md + tasks.json) = phase `plan_failed`, exit 2, a gate_a.md that names the cause and `continue --replan`, no traceback | Gate A; with `START` it continues, except on `QUESTION:` risks, PRE-BROKEN or SUSPECT checks |
 | `continue [--replan] [--diagnose] [--refresh-quota]` | from `gate_a`: `ready` → the work loop → the final review → `REPORT.md` + `gate_b.md`; from any interrupted phase: resumes it; `--replan`: the planner again after answers in `request.md`; `--diagnose`: the lenses and the reviewer run even when `check --all final` fails (default: `FAIL` right away, PERF-02; from `gate_b` it is a new review generation); `--refresh-quota`: `codex_task.py usage` before the work and after the review (PERF-03) | Gate B |
 | `verify --tasks id:author:round[,…]` | only `check` + verifier for the named tasks (after a fixed check command); merged into `results.json`; every `BLOCKED_DEP` task whose dependencies now PASS is released (the chain too) and the phase goes back to `work`, so `continue` runs them without touching the PASS tasks | (then `continue`) |
 | `status [--run-dir R]` | phase, recon/prepare/baseline, per task status, running agents, cost, the next step | - |
@@ -126,6 +126,7 @@ The **Path** column says where the rule is actually executed (V2-14: the two loo
 | A check has not passed without a `power_check.py` report | code (checks are subprocesses of the harness; a missing final check is a hard stop; only `CLEAN` / `FIXED` close the final review - any other status, unknown, `RUNNING`, empty or missing, is a stop, V3-05; an invalid `## POWER` block is INFRA for every check instead of an empty smoke suite, V3-06) | `power_run.py`, `power_check.py cmd_check`, tests hardstops / finalstatus / configbroken | harness + Workflow (the Workflow copies CHECK_JSON through a runner agent) |
 | Code is never verified by its author | code (`verifier_for`, `other_claude()` after a Codex failure; `results.json` carries the real `author` / `verified_by` and the accumulated `authors` of the task - work, fix, finish; a restore to the snapshot clears them; `Run.authors()` adds every final fixer, V3-02; the escalation model and its fallback are chosen by the real author of the rejected code; the final reviewer by the real authors of all retained code - `review_choice`: step 3 when it wrote nothing, else the other strong Claude, else Astra when the run has it; when every strong model wrote code the review is recorded `independent: false` and is a hard stop) | `power_run.py`, tests codex / codexfallback / realauthor / authors | harness (Workflow: `verifierFor` per task, the escalation shift and `authors` in the result; no real-author final review - the session's) |
 | Every agent has a type and a hard call cap | code for Claude agents (`start` preflight of the agent types; `--max-turns`, `--max-budget-usd` per role); Codex jobs have a sandbox, a schema and `JOB_TIMEOUT` instead, their tool-call budget is prompt only; + prompt (`BUDGET` in the prompts) | `power_run.py ROLES`, `codex_task.py`, test noagents | harness (Workflow: `agentType` only, no budget flag) |
+| No agent opens a workflow or a fan-out of its own (POWER owns the turn, 17.10) | code (every Claude agent gets `--disallowedTools Workflow,Agent` when `state.cli_disallowed_tools` is true: `start` probes the CLI once with `claude --help`, `continue` / `verify` probe a state from before 17.10 once, the log names the result; a CLI without the flag runs the agents without it, logged) + external (the session itself: no Workflow / Agent of its own besides the fallback, no `isolation: "worktree"`, the POWER caps and menu instead of ultracode's sizes, SKILL §1) | `power_run.py probe_disallowed / ensure_cli_probe / claude_call`, `tests/mock_claude.py` (`--help`, `MOCK_OLD_CLI=1`), test ultraguard | harness (Codex jobs are not Claude agents; the Workflow path: external only) + external |
 | One harness process per run; the agent cap | code (`run.lock` = OS lock on an open handle, `POWER_MAX_AGENTS` → INCOMPLETE) | `power_run.py`, tests lock / lockatomic / cap | harness only |
 | A failed Codex runner cannot keep editing | code (`codex_task.py kill` before the fallback; a kill that is not confirmed = no fallback) | tests codexkill / killfailed / killtree (Windows and WSL Ubuntu), Astra's kill_tree probes in WSL | harness + Workflow (`codexKill` before every fallback); Windows `taskkill /T`; POSIX: the process group plus every descendant listed before the first signal, a SIGTERM grace for the whole tree, SIGKILL for what survives, a zombie counts as gone (V3-01) |
 | Old review evidence never covers a new working tree or a dead reviewer | code (review generations: `final_history`, `archive/final.g<N>/`, `--gen` Codex job names, CLEAN needs this generation's check) | test reviewgen | harness |
@@ -142,11 +143,16 @@ The **Path** column says where the rule is actually executed (V2-14: the two loo
 | Baseline: a red check before any edit is not blamed on the executor | code (PRE-BROKEN / SUSPECT stop START) | `power_check.py baseline`, test prebroken | harness (+ `codex_task.py ready` for the Workflow) |
 | Project smoke runs before the deploy | code (`smoke` commands in `check --all`, a failure fails the final check) | test smoke | harness |
 | A failed final check runs no lens and no reviewer | code (PERF-02: `_phase_final` ends with `FAIL`, `short_circuit: true`, `review.verdict: SKIPPED`, the deploy plan not evaluated; `continue --diagnose` runs the full review as a new generation) | `power_run.py _phase_final / cmd_continue`, test perfshort | harness |
+| Gate B shows what the run did not check | code (`coverage_block` → `final.coverage`, once per review generation that does not end INCOMPLETE: the passing verifiers' `unchecked` (at most 5 per task), lenses with no report after one retry (`lens:<name>#2`, skipped when the agent cap is near; none on a PERF-02 short circuit), config lenses FAST skipped, agents a turn or budget cap stopped (`cap` in `calls.jsonl`), run files `deploy.json` leaves out (`deploy_plan.not_deployed`, from the `plan` output), the lenses' `Skipped:` and recon's `Unmapped:` lines; Gate B prints at most `GATE_B_GAPS` (10) lines + "(+N още в REPORT.md)", REPORT every line; a state from before 17.10 prints nothing) + prompt (the verifiers fill `unchecked`, a lens ends with `Skipped:`, recon with `Unmapped:`) | `power_run.py coverage_block / coverage_lines / gate_b_text / report_text`, `power_prompts.py UNCHECKED_RULE / LENS`, test coverage | harness (Workflow: `unchecked` in the task outcome only) |
+| The final review checks the request, not only the diff | prompt (the reviewer reads `request.md` with "Решения на #THE_OPERATOR#" and the plan's non-goals and writes `coverage[]`: at most 10 items, done / partial / missing / out_of_scope_by_plan) + code (`final.review.coverage`, at most 20 rows kept; a `missing` item is a medium finding: the final fix path runs even without findings and `findings_text` gives it to finalfix / finalverify; Gate B prints the missing and partial items, REPORT every row) | `power_prompts.py REVIEW / findings_text`, `codex_task.py REVIEW_SCHEMA`, `power_run.py _phase_final / coverage_lines`, test requestcov | harness (Astra's review: the same fields through the schema) |
+| The lens findings the reviewer threw out stay visible | prompt (`dismissed[]`: lens, file, line, severity, reason, evidence) + code (`final.review.dismissed`; a `review.json` without the key = `dismissed_missing`: a log warning and a ВНИМАНИЕ line in Gate B and REPORT, never silence; Gate B the count, REPORT every entry) | `power_prompts.py REVIEW`, `codex_task.py post_process`, `power_run.py _phase_final / gate_b_text / report_text`, test requestcov | harness |
+| One severity rubric for the lenses and the reviewer | prompt only (`SEVERITY` in the lens and review prompts: critical or high = wrong money, stock or order status, an auth or role leak, injection, data loss, a regression on every page or for a whole role; medium = a wrong result in a realistic path; low = cosmetic or hypothetical) | `power_prompts.py SEVERITY`, test requestcov (the text is in both prompts) | both loops (`power_prompts.py` writes the prompts) |
+| Gate A's cost line is indicative, never a cap | code (`cost_forecast`: the `harness/calls.jsonl` of the sibling runs in the run's parent folder, this run left out, each with at least one priced call (ok, cost > 0); fewer than `FORECAST_MIN_RUNS` (3) = no line; the expected calls per role × the median (range p25-p75) of role and model, else the role's median over all models or nothing, both named in the line; a Codex model is quota, not $; plus what recon and plan already spent) | `power_run.py cost_forecast / gate_a_text`, test forecast | harness |
 | No paid Codex probe without a request | code (PERF-03: `codex_task.py usage` only with `--refresh-quota`; the report says when it was not fetched) | `power_run.py codex_usage`, tests quota / codex | harness |
 | An agent spends no tool round on its own instructions | code (PERF-04: `inline_prompt` puts the rendered prompt in the message, the file stays as the audit copy and is named in the message; a missing file falls back to `Read <file>`) | `power_run.py claude_msg / named_msg`, test perfshort | harness (the Workflow still says `Read`) |
 | Hard stops beat `DEPLOY` | code for the ones the scripts can see (BLOCKED / INCOMPLETE, unclosed final, failed or missing final check, SUSPECT, DB steps, sensitive files, `needs_yes`, conflicts, binary without backup, canary down, candidate / prod / `deploy.json` changed, approval for another candidate, rollback) | `power_run.py hard_stops`, `power_deploy.py`, both test suites | harness + deploy |
 | Changes to orders / customers / data; judging a merged diff; partial deploy | external (orchestrator's judgement; the scripts show the diffs and ask) | SKILL §7-8 | external |
-| No deploy with an unanswered question, even with `START DEPLOY` | code (`needs_yes` → `--yes N --approved`, `--force` does not cover it) | `power_run.py deploy`, test start | harness `deploy` + deploy |
+| No deploy with an unanswered question, even with `START DEPLOY` | code (`needs_yes` → `--yes N --approved`; the harness's coverage questions → `--yes cN --approved`: c1 lenses with no report, c2 run files `deploy.json` leaves out, c3 a PASS task whose `unchecked` names one of its own files that `deploy.json` uploads; asked only when `deploy.json` uploads files and the review left `final.coverage`; a cN yes counts for its candidate and its exact text, a changed gap is open again; `--force` covers neither; `deploy.json` is never edited) | `power_run.py deploy / coverage_questions / unanswered_questions / hard_stops`, tests start / coverage | harness `deploy` + deploy (cN: the harness only) |
 | A yes is for one candidate | code (`--approved <attempt:hash>`, `NOT_APPROVED` / `APPROVAL_MISMATCH`, stale answers) | tests approval / start / deploytwice | harness `deploy` + deploy |
 | Prod is written only by the orchestrator, serially, with backup and verified rollback | code (`power_deploy.py`: `attempted` before put, byte verify, canary, rollback statuses) + prompt (agents are told never to touch prod) | `tests/test_power_deploy.py` | deploy (policy, not actor authorization - see Trust boundary) |
 | DB / option / flag steps | external for the `apply` commands (the orchestrator runs them after a yes); code makes them a hard stop and never runs the `apply`; the ONE script that runs DB commands is `watch --go --db-rollback`: the `rollback` of every DB step after a crash, recorded in `db_rollbacks` with their exit codes, separate from the file rollback status (a verified file restore does not prove the DB restore - the orchestrator reads both) | `power_deploy.py cmd_watch`, `power_run.py hard_stops` | deploy (`watch --db-rollback`) + external |
@@ -215,12 +221,19 @@ and the hard stop in place.
 ## Files in `<run>/harness/`
 
 - `state.json`: flags, models, Codex slugs, agent types, phase, recon/prepare/baseline results, the Workflow-style
-  `args`, per task outcome (`tasks`), the final review block (`final`), deploy status.
+  `args`, per task outcome (`tasks`), the final review block (`final`), deploy status. Since 17.10 also:
+  `cli_disallowed_tools` (the `claude --help` probe; true = every agent gets `--disallowedTools Workflow,Agent`), a
+  task outcome's `unchecked` (the passing verifier's list, at most 5), `final.coverage` (what the generation did not
+  check; archived with it in `final_history`), `final.review.coverage` / `dismissed` / `dismissed_missing`,
+  `final.deploy_plan.not_deployed`, and `deploy_answers` keyed by the `needs_yes` number or by `cN`
+  (`{text, at, candidate}`; a cN yes counts only for the same candidate and text).
 - `status.json`: `{phase, done, total, last_item, updated_at, running, cost_usd}` (the batch convention; a status
   reader prints it).
 - `log.txt`: one line per event (agent done, check PASS/FAIL, verdict, escalation, phase).
 - `calls.jsonl`: one line per agent process: label, role, model, agent type, turns, input/cache/output tokens,
-  `total_cost_usd` (0 on the subscription for some models; the input tokens are the measure), ok/error.
+  `cost_usd` (the CLI's `total_cost_usd`; 0 on the subscription for some models; the input tokens are the measure),
+  ok/error, and `cap` (the subtype, e.g. `error_max_turns`) when a turn or budget cap ended the agent. The sibling
+  runs' files are the history of Gate A's cost line.
 - `gate_a.md`, `gate_b.md`: the messages for #THE_OPERATOR#, in Bulgarian, relayed by the session as they are.
 
 The rest of the run (`PLAN.md`, `tasks.json`, `recon/`, `prompts/`, `before/`, `checks/`, `results.json`, `review/`,
@@ -241,12 +254,39 @@ Roles, turns, budgets: `ROLES` in `power_run.py` (reader 32 turns, verifier 25/3
 2-15 USD per agent, scaled by `POWER_BUDGET_SCALE`). The permission mode is `auto` (measured: the default headless
 mode denies Bash; `acceptEdits` and `auto` allow the agent's edits and commands).
 
+## Config file (15.10)
+
+`load_config` reads, per directory from the project upwards, `.claude/power.json` when it exists, else the `## POWER`
+json block of `CLAUDE.md` (the same keys and merge: lists add up, for other keys the nearest wins); both in one
+directory is a `PlanError` (`PREFLIGHT FAILED` at start, INFRA in a check, like an invalid block), never a merge.
+The file keeps the json out of every session's context (as a `CLAUDE.md` block it cost ~1.5k tokens per session). Test: `powerjson`.
+
+## FAST (15.10)
+
+`start --flags …,FAST` (or `--fast`) writes `fast: true` into `state.json`; every command of the run reads it from
+there, so `continue`, `verify` and `deploy` need no flag and a run started without it keeps the old knobs (the state
+has no `fast`, or `false`). What changes, all in `power_run.py` (`FAST_EFFORT`, `FAST_MODEL`, `FAST_PARALLEL`):
+
+| Knob | Without FAST | With FAST |
+|--|--|--|
+| `work`, `fix`, `area` agents | no `--effort` (the model's default) | `--effort medium` |
+| recon and lens agents | sonnet, `effort low` | haiku, `effort low` (a project lens `agent_type` keeps its own prompt and tools) |
+| parallel agent slots | `POWER_MAX_PARALLEL` (6) | `max(POWER_MAX_PARALLEL, POWER_FAST_PARALLEL)` = 8, unless `POWER_MAX_PARALLEL` is set explicitly |
+| config lenses with `"fast": false` | run | skipped (an explicit `--lens` list is never filtered) |
+| the echo line | `POWER START · …` | `POWER START FAST · … · FAST: изпълнение effort medium, recon/лещи Haiku, паралел 8` |
+
+Unchanged on purpose: the planner, the verifier of every task, escalation, the final review and its fixer / verifier,
+`check --all final`, the smoke commands, the hard stops, Gate A / Gate B and the deploy script - FAST buys speed only
+where a wrong answer is caught by someone else. The session skips the model menu (Opus / Sonnet / Opus) and passes the
+flag; nothing else in the protocol changes. Test: `fast`.
+
 ## Environment
 
 | Variable | Default | Why |
 |--|--|--|
 | `POWER_CLAUDE` | `claude` on PATH | the command (forward slashes on Windows); `start` preflights it (a missing command = `PREFLIGHT FAILED`, nothing started); the tests point it at `tests/mock_claude.py` |
 | `POWER_MAX_PARALLEL` | 6 | agent processes at once (each is a node process; the Codex limit is separate) |
+| `POWER_FAST_PARALLEL` | 8 | agent processes at once in a FAST run (`max(POWER_MAX_PARALLEL, this)`); an explicit `POWER_MAX_PARALLEL` wins |
 | `POWER_MAX_AGENTS` | 0 | cap on the agents one run may start (0 = none); at the cap the phase stops with INCOMPLETE, `continue` resumes |
 | `POWER_PERMISSION_MODE` | `auto` | `--permission-mode` of every agent |
 | `POWER_AGENT_TIMEOUT` | 3600 | seconds per agent process, then it counts as dead |
@@ -260,13 +300,14 @@ mode denies Bash; `acceptEdits` and `auto` allow the agent's edits and commands)
                                                                  finalfixmismatch smoke codex codexfallback lock cap codexkill
                                                                  watchrollback reviewgen killfailed lockatomic deploysealed
                                                                  verifystray realauthor planchanges afterhook preflight workflow killtree
-                                                                 authors finalstatus configbroken readiness]
+                                                                 authors finalstatus configbroken readiness perfshort quota
+                                                                 polling fast powerjson ultraguard coverage requestcov forecast]
     PYTHONUTF8=1 python "<skill>/tests/test_power_deploy.py" [--keep] [canary_before partial_write rollback_fail new_file_cleanup refetch
                                                                     remote_changed candidate_changed binary_unknown approval binary_guard
                                                                     precheck_all effective_config merge_error backup_integrity seal
                                                                     after_hooks recovery_hooks watch_degraded]
 
-A synthetic git project under `D:\tmp\prun_test\<case>` (two PHP files, the skill's agent types in `.claude/agents`,
+A synthetic git project under `<system temp>/prun_test/<case>` (`POWER_TEST_ROOT` replaces `<system temp>/prun_test`; two PHP files, the skill's agent types in `.claude/agents`,
 a `## POWER` block with lenses and a `cp` deploy profile against a fake prod folder), a scenario json per case, the
 fake `claude` (`tests/mock_claude.py`: applies the scenario's edits, writes the run files, prints the JSON envelope,
 records every call), the fake `codex_task.py` (`tests/mock_codex.py` via `POWER_CODEX_HELPER`, with a `CODEX_HOME`
@@ -305,8 +346,21 @@ a failed final check = `FAIL`, no lens, no reviewer, `deploy --go` refused, `con
 2 and a plain `continue` from `gate_b` runs nothing; PERF-04: every Claude agent got its instructions inline and the
 prompt files stay), `quota` (PERF-03: `--refresh-quota` fetches the Codex usage twice and the report shows both; `codex`
 proves none without it) and `polling` (PERF-09: `codex_task.run_job` reports a finished job within 0.25 s and a later
-one within one backoff step, against the real module) - forty-one in all; `killtree`, `codexkill` and `polling` also
-run in WSL Ubuntu, where Astra's `kill_tree_zombie` / `kill_tree_survivor` probes pass (V3-01).
+one within one backoff step, against the real module); 15.10 adds `fast` (the FAST profile: haiku recon and lenses,
+`--effort medium` for work and fix, a `"fast": false` lens skipped, plan / verifier / review untouched, the echo line,
+`--fast` alone, a run without the flag unchanged, an unknown flag refused) and `powerjson` (the config in `.claude/power.json`: source, lenses, both sources refused,
+invalid file = preflight stop); 17.10 (Wave 1 of the ultracode review) adds `ultraguard` (the `--help` probe kept in
+the state and `--disallowedTools Workflow,Agent` on every agent; an old CLI, `MOCK_OLD_CLI=1`, gets no flag and
+reaches Gate B as before; a state without the probe is probed once by `continue`; `tests/mock_claude.py` answers
+`--help` before reading stdin and records the flag per call), `coverage` (a verifier's `unchecked`, a lens dead twice
+after exactly one retry, the cap hits, a run file left out of `deploy.json`, a lens `Skipped:` and a recon `Unmapped:`
+line in `final.coverage`; Gate B 10 lines + "(+1 още в REPORT.md)" and c1-c3 as hard stops; `--go --force` refused,
+`--yes c9` refused, `--yes C2` recorded with the candidate and the text, a changed gap opens c2 again), `requestcov` (a
+`missing` request item runs finalfix + finalverify and reaches the fixer's prompt as medium; Gate B the missing and
+partial items and the dismissed count, REPORT every row and the evidence; no `dismissed` key = the warning; the rubric
+and the `Skipped:` line in the prompts) and `forecast` (three priced sibling runs give the exact Gate A line and name
+the role fallback; two plus a cost-0 run give none) - forty-seven in all; `killtree`, `codexkill`
+and `polling` also run in WSL Ubuntu, where Astra's `kill_tree_zombie` / `kill_tree_survivor` probes pass (V3-01).
 `tests/test_power_deploy.py` (eighteen
 scenarios, a controllable transport `tests/fake_transport.py` and canned probes via `POWER_PROBE_MAP`) covers the
 deploy script alone: canary down before the upload, a put that writes and then fails, a failing rollback, new-file

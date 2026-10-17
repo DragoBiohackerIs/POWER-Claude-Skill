@@ -13,7 +13,7 @@ The plan lives in <run>/tasks.json:
    "review_focus", "rules", "size": {"files", "lines"}, "depends_on": [task or contract ids]}
 
 Subcommands (a human summary, then one machine line that starts with a TAG):
-  config   --project-dir P                        merged json block of every `## POWER` section above P
+  config   --project-dir P                        merged POWER config (`.claude/power.json`, else the `## POWER` block of CLAUDE.md) of every directory above P
   merge    --run-dir R                            skeleton.json + plan-areas/*.json -> tasks.json + PLAN.md
   prepare  --run-dir R --project-dir P            normalize + validate tasks.json (written back when valid)
   snapshot --run-dir R --project-dir P [--force]  copy every owned file to <run>/before/ + scope baseline
@@ -198,7 +198,7 @@ def in_dir(path, rel_dir):
     return bool(rel_dir) and (path == rel_dir or path.startswith(rel_dir + "/"))
 
 
-# ---------- project config (`## POWER` json block in CLAUDE.md files) ----------
+# ---------- project config (`.claude/power.json`, else the `## POWER` json block of CLAUDE.md, per directory) ----------
 
 def power_block(md_path):
     try:
@@ -221,14 +221,38 @@ def power_block(md_path):
         raise PlanError(f"invalid json in the ## POWER section of {md_path}: {e}")
 
 
+POWER_JSON = os.path.join(".claude", "power.json")
+
+
+def power_config(d):
+    """The POWER config of one directory: `.claude/power.json` when it exists, else the `## POWER` json block of its
+    CLAUDE.md (15.10: the file keeps the json out of every session's CLAUDE.md). Both at once is an error, never a
+    merge - two sources would drift. Returns (block, source path) or (None, None)."""
+    jp, md = os.path.join(d, POWER_JSON), os.path.join(d, "CLAUDE.md")
+    if not os.path.isfile(jp):
+        return power_block(md), md
+    try:
+        with open(jp, encoding="utf-8") as f:
+            block = json.load(f)
+    except ValueError as e:
+        raise PlanError(f"invalid json in {jp}: {e}")
+    except OSError as e:
+        raise PlanError(f"cannot read {jp}: {e}")
+    if not isinstance(block, dict):
+        raise PlanError(f"invalid json in {jp}: expected an object")
+    if power_block(md) is not None:
+        raise PlanError(f"two POWER configs in {d}: {POWER_JSON} and the ## POWER block of CLAUDE.md - keep one")
+    return block, jp
+
+
 def load_config(project_dir):
-    """Lists add up from the project upwards; for other keys the nearest CLAUDE.md wins."""
+    """Lists add up from the project upwards; for other keys the nearest config wins."""
     cfg = {"deny": [], "allow": [], "lenses": [], "smoke": [], "sources": [], "_dirs": {}}
     d = os.path.abspath(project_dir)
     while True:
-        block = power_block(os.path.join(d, "CLAUDE.md"))
+        block, source = power_config(d)
         if block:
-            cfg["sources"].append(os.path.join(d, "CLAUDE.md"))
+            cfg["sources"].append(source)
             for k, v in block.items():
                 if isinstance(v, list) and isinstance(cfg.get(k), list):
                     cfg[k].extend(v)
@@ -738,7 +762,7 @@ def cmd_config(a):
         out(json.dumps(cfg, ensure_ascii=False, indent=2))
         return
     # Short by default: the output lands in the orchestrator's context for the whole run (the json is ~4k tokens).
-    out("sources: " + (", ".join(fwd(s) for s in cfg["sources"]) or "none (no ## POWER section)"))
+    out("sources: " + (", ".join(fwd(s) for s in cfg["sources"]) or "none (no .claude/power.json or ## POWER section)"))
     out(f"deny: {len(cfg['deny'])} patterns, allow: {len(cfg['allow'])}, smoke: {len(cfg['smoke'])} commands, "
         f"claim: {cfg.get('claim') or '-'}")
     out("lenses: " + (", ".join(str(l.get("name")) + (f" ({l.get('agent_type')})" if l.get("agent_type") else "")

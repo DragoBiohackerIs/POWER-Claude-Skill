@@ -49,9 +49,10 @@ const RESULT = {
   },
   required: ['status', 'files_changed', 'mismatch', 'summary', 'how_verified', 'open_issues', 'plan_change'],
 }
+// `unchecked` (what the verifier did not check, at most 5) is optional: a verifier that omits it still passes the schema
 const VERDICT = {
   type: 'object',
-  properties: { pass: { type: 'boolean' }, problems: STR_LIST, plan_problem: { type: 'boolean' }, notes: STR },
+  properties: { pass: { type: 'boolean' }, problems: STR_LIST, plan_problem: { type: 'boolean' }, notes: STR, unchecked: STR_LIST },
   required: ['pass', 'problems', 'plan_problem', 'notes'],
 }
 const CHECK = {
@@ -237,6 +238,8 @@ function outcome(t, status, r, verdicts, reason, escalated, strays, planChanges,
     result: strip(r),
     last_problems: last && !last.pass ? last.problems : [],
     notes: last ? last.notes || '' : '',
+    // what the verifier that passed the task did not check (the session's Gate B "НЕПРОВЕРЕНО" section)
+    unchecked: last && last.pass ? (last.unchecked || []).slice(0, 5) : [],
     stray_files: stray,
     // files changed outside every task list that only the diff shows (check's scope_changes): SUSPECT for the
     // orchestrator, the verdict stands (the harness turns it into a hard stop)

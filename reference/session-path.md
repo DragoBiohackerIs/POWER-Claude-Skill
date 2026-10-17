@@ -8,9 +8,14 @@ Opus (`/model opus`) before anything starts. Everything below is the former SKIL
 # POWER mode (session path)
 
 Protocol for a large task with maximum parallel work and minimum intervention from #THE_OPERATOR#. One skill for all projects
-under `d:\Claude\`; project specifics come from `## POWER` in the project's `CLAUDE.md`. This skill is the explicit
-opt-in for the **Workflow** tool. This file is the core (read it whole); the details are in `reference/` and are
-read only in the phase they belong to:
+in the workspace; project specifics come from `## POWER` in the project's `CLAUDE.md`. This skill is the explicit
+opt-in for the **Workflow** tool. **POWER owns the turn** (SKILL §1, 17.10): a POWER message runs by this protocol
+even when ultracode is on (the keyword, `/effort ultracode`, `--effort ultracode`, settings `"ultracode": true`), and
+ultracode is suspended for the run. This fallback is the one documented exception to SKILL §1's "no Workflow or Agent
+tool of the session's own": the Workflow `power-execute` and the Agent calls this file names, within the budget of §5
+and the model menu of §2, never ultracode's sizes or `isolation: "worktree"` [external: on this path no harness
+passes `--disallowedTools`, the session's discipline is the only guard]. This file is the core (read it whole); the
+details are in `reference/` and are read only in the phase they belong to:
 
 All messages to #THE_OPERATOR# are in Bulgarian; file contents, plans and reports follow the project rules.
 
@@ -19,7 +24,7 @@ All messages to #THE_OPERATOR# are in Bulgarian; file contents, plans and report
 | `reference/plan.md` | phase 1: what an executable plan is, a large plan by areas, the agent budgets |
 | `reference/workflow.md` | phase 2-3: what `power_workflow.js` does, statuses, BLOCKED cases |
 | `reference/deploy.md` | phase 6: `power_deploy.py` step by step, rollback, hard stops |
-| `reference/gates.md` | Gate A/B: the table for #THE_OPERATOR# and the `/compact` hint |
+| `reference/gates.md` | Gate A/B: the table for #THE_OPERATOR# and the `/clear` hint |
 | `reference/codex-config.md` | on a Codex step; on a new project: the `## POWER` json block |
 | `reference/setup.md` | new machine or `install --check` reports missing settings; sharing the skill |
 
@@ -33,7 +38,7 @@ First run on a machine: `python "<skill>/power_check.py" install`, then the sett
 
 ## 1. Trigger, flags, session model
 
-The standalone word `POWER` in capitals at the start of the message (not POWERCasino, NADPower). Four forms,
+The standalone word `POWER` in capitals at the start of the message (not part of a word such as SUPERPOWER). Four forms,
 no model names in the command; `START` and `DEPLOY` only in capitals, so that the word "deploy" in the task text
 does not trigger them:
 
@@ -115,8 +120,8 @@ the switch (#THE_OPERATOR#'s decision); it continues on Fable only if #THE_OPERA
 5. Read the project's `CLAUDE.md`, `python "<skill>/power_check.py" config --project-dir <project>` (short output;
    `--full` for the whole json), TODO and the deploy docs.
    The answers from item 1 and every later correction from #THE_OPERATOR# („не пипай X") go into `request.md`, section „Решения на #THE_OPERATOR#":
-   the planner reads the file, and after `/compact` the session reads it instead of remembering.
-6. CLAIM, if the project has one (`claim` in `## POWER`; for example `.project/SESSIONS.md`); files are added after the plan.
+   the planner reads the file, and after `/clear` the fresh session reads it instead of remembering.
+6. CLAIM, if the project has one (`claim` in `## POWER`; for example `.project/CLAIMS.md`); files are added after the plan.
 
 ## 4. Phase 1: plan
 
@@ -134,7 +139,7 @@ the switch (#THE_OPERATOR#'s decision); it continues on Fable only if #THE_OPERA
    `"known_broken": true` + a line in PLAN.md, or a question.
 4. CLAIM: add the files.
 5. **Gate A** (only without `START`): the table from `reference/gates.md`, wait for „да". Changes → `tasks.json` →
-   `prepare` → `baseline`. Above 150k context: the `/compact` hint from there.
+   `prepare` → `baseline`. Above 150k context: the `/clear` hint from there.
 6. **Right before the Workflow** (snapshot as fresh as possible): `codex_task.py ready --step1 <…> --step2 <…>` =
    prepare → snapshot → prompts → `args` (with `START` add `--baseline`: item 3 is then skipped and `ready` is the whole
    preparation). `snapshot --force` only if the plan changed after snapshot and work has not started.
@@ -193,7 +198,7 @@ the session); the deploy plan, the risks and what is checked manually.
 reviews the reduced diff. The question is always explicit, also with `DEPLOY` (in Bulgarian): „Качвам t1, t2, t4-t6 без t3?"
 
 **Gate B** (only without `DEPLOY`): „#THE_OPERATOR#, трябва да решиш дали да деплойна: …" and wait; before it the
-`/compact` hint per `reference/gates.md`, if context is above 150k.
+`/clear` hint per `reference/gates.md`, if context is above 150k.
 
 ## 8. Phase 6: deploy
 
@@ -227,6 +232,9 @@ SKILL §9.
 - Code is not verified by the model that wrote it.
 - No deploy with an unanswered question, even with `START DEPLOY`.
 - No agent without a call cap or without a type from `agents/`; no planning or review in the session itself; no reading of whole modules.
+- No ultracode inside a POWER run (SKILL §1, §10): the Workflow `power-execute` and the Agent calls of this file are
+  the only fan-out, with the budget of §5 (3 per task, up to 10 on escalation, ~50 per Workflow); no worktree
+  isolation, no ultracode sizes [external].
 - Everything independent runs in parallel (recon with the menu, baseline while #THE_OPERATOR# reads the plan, the tasks, the lenses,
   fetch during the review). Sequential only for a shared resource: the prod upload (order + clean rollback),
   requests to prod (WAF pace), checks with `serial: true` (lock), Codex up to 6 processes.

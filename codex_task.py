@@ -87,7 +87,8 @@ def enum(*values):
 
 RESULT_SCHEMA = obj({"status": enum("DONE", "PLAN_MISMATCH"), "files_changed": STR_LIST, "mismatch": STR,
                      "summary": STR, "how_verified": STR, "open_issues": STR_LIST, "plan_change": STR})
-VERDICT_SCHEMA = obj({"pass": BOOL, "problems": STR_LIST, "plan_problem": BOOL, "notes": STR})
+VERDICT_SCHEMA = obj({"pass": BOOL, "problems": STR_LIST, "plan_problem": BOOL, "notes": STR,
+                      "unchecked": STR_LIST})   # what the verifier did not check (Gate B "НЕПРОВЕРЕНО")
 CHECK_ITEM = obj({"name": STR, "cmd": STR, "expect_exit": INT, "contains": STR_LIST, "not_contains": STR_LIST,
                   "before": enum("fail", "pass", "any"), "serial": BOOL, "timeout": INT, "retries": INT})
 TASK_SCHEMA = obj({
@@ -115,6 +116,11 @@ REVIEW_SCHEMA = obj({
     "verdict": enum("PASS", "PASS_WITH_FIXES", "FAIL"),
     "findings": {"type": "array", "items": obj({"severity": enum("critical", "high", "medium", "low"),
                                                 "file": STR, "line": INT, "problem": STR, "fix": STR})},
+    # the request items against the change, and the lens findings the reviewer threw out (Gate B / REPORT.md)
+    "coverage": {"type": "array", "items": obj({"request_item": STR, "where": STR,
+                                                "status": enum("done", "partial", "missing", "out_of_scope_by_plan")})},
+    "dismissed": {"type": "array", "items": obj({"lens": STR, "file": STR, "line": INT, "reason": STR, "evidence": STR,
+                                                 "severity": enum("critical", "high", "medium", "low")})},
     "review_md": STR, "deploy_md": STR, "deploy": DEPLOY_SCHEMA})
 
 # kind -> (sandbox, schema)
@@ -146,7 +152,7 @@ def failure_object(kind, reason):
         return {"status": "CODEX_FAILED", "files_changed": [], "mismatch": "", "summary": "CODEX_FAILED: " + reason,
                 "how_verified": "", "open_issues": [reason], "plan_change": ""}
     if kind in ("verify", "finalverify"):
-        return {"pass": False, "problems": [], "plan_problem": False, "notes": "CODEX_FAILED: " + reason}
+        return {"pass": False, "problems": [], "plan_problem": False, "notes": "CODEX_FAILED: " + reason, "unchecked": []}
     return {"failed": reason}
 
 
@@ -276,7 +282,9 @@ def post_process(a, kind, job, result):
         write_text(os.path.join(r, "REVIEW.md"), result.get("review_md", ""))
         write_text(os.path.join(r, "DEPLOY.md"), result.get("deploy_md", ""))
         write_json(os.path.join(r, "review.json"), {"verdict": result.get("verdict"),
-                                                     "findings": result.get("findings", [])})
+                                                     "findings": result.get("findings", []),
+                                                     "coverage": result.get("coverage", []),
+                                                     "dismissed": result.get("dismissed", [])})
         if isinstance(result.get("deploy"), dict):
             write_json(os.path.join(r, "deploy.json"), result["deploy"])
         summary = f"wrote REVIEW.md, DEPLOY.md, deploy.json, review.json (verdict {result.get('verdict')}, {len(result.get('findings', []))} findings)"
